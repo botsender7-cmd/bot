@@ -561,7 +561,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from keyboards import get_media_label
             icon, fmt = get_media_label(msg.get("media_type"))
             status = "⏳ Pending" if msg["status"] == "pending" else "✅ Sent" if msg["status"] == "sent" else f"❌ {msg['status']}"
-            time_str = msg["schedule_time"][:16] if msg["schedule_time"] else "N/A"
+            st = msg.get("schedule_time")
+            if not st:
+                time_str = "N/A"
+            elif hasattr(st, "strftime"):
+                time_str = st.strftime("%Y-%m-%d %H:%M")
+            else:
+                time_str = str(st)[:16]
             target = str(msg.get('target_type', '?')) + ' -> ' + str(msg.get('target_id', '?'))
             preview = msg.get("media_caption") or msg.get("message_text") or "—"
             if len(preview) > 80:
