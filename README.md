@@ -29,7 +29,16 @@ pinned: false
 
 ### 1. Postgres Database Setup
 This bot uses plain Postgres via `DATABASE_URL` (e.g. a free Neon project), not Supabase.
-Run your schema/migrations against that database before first start.
+**Tables are created automatically on startup** — `database.py` reads `schema.sql` and runs it
+(`CREATE TABLE IF NOT EXISTS ...`) every time the bot boots, so a fresh database will self-provision
+on first deploy. If `schema.sql` is missing from the deploy or the auto-create fails for any reason
+(e.g. the DB user lacks CREATE privileges), the bot will refuse to start and log the exact error —
+it will NOT fall back to silently running against a half-missing schema.
+
+You can still run it by hand if you prefer:
+```bash
+psql "$DATABASE_URL" -f schema.sql
+```
 
 ### 2. Environment Variables
 Copy `.env.example` to `.env` and fill in your credentials:

@@ -1,9 +1,15 @@
+import os
 import psycopg2
 import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
 from contextlib import contextmanager
 from config import Config
 from datetime import datetime, date
+
+# Full schema, embedded so the bot can create its own tables on first boot.
+# Kept in sync with schema.sql (same file, also runnable manually via
+# `psql "$DATABASE_URL" -f schema.sql` if you'd rather run it by hand).
+_SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
 
 class Database:
@@ -19,6 +25,34 @@ class Database:
         # connections open when the bot is idle; maxconn=5 is plenty for a
         # single-worker Telegram bot handling requests one at a time.
         self.pool = ThreadedConnectionPool(1, 5, dsn=self.dsn, sslmode="require")
+
+        self._ensure_schema()
+
+    def _ensure_schema(self):
+        """Creates every table/index from schema.sql if it doesn't already exist.
+        Runs on every startup — all statements are CREATE ... IF NOT EXISTS, so
+        this is a no-op once the schema is in place. Unlike _query(), failures
+        here are NOT swallowed: if this breaks, the bot should refuse to start
+        rather than run silently against a half-missing schema."""
+        if not os.path.exists(_SCHEMA_PATH):
+            print(f"[DB INIT] WARNING: schema.sql not found at {_SCHEMA_PATH} — skipping auto-create. "
+                  f"Tables must already exist or every query will fail.")
+            return
+
+        with open(_SCHEMA_PATH, "r") as f:
+            schema_sql = f.read()
+
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(schema_sql)
+            conn.commit()
+            print("[DB INIT] Schema check complete — all tables/indexes present.")
+        except Exception as e:
+            conn.rollback()
+            raise RuntimeError(f"Schema auto-create failed: {e}") from e
+        finally:
+            self.pool.putconn(conn)
 
     @contextmanager
     def _conn(self):
