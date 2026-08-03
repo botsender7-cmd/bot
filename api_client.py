@@ -14,6 +14,11 @@ from config import Config
 _TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 _RETRIES = 2
 
+# Guard against a trailing slash in API_BASE_URL (e.g. "https://host.app/")
+# producing a double slash like ".../ /api/ai/chat", which triggers a 308
+# redirect that httpx won't follow by default — silently breaking every call.
+_BASE_URL = (Config.API_BASE_URL or "").rstrip("/")
+
 
 def _headers():
     h = {}
@@ -24,11 +29,11 @@ def _headers():
 
 async def ai_chat(user_id: int, prompt: str):
     """Calls POST /api/ai/chat. Returns (response_text_or_None, status_message)."""
-    url = f"{Config.API_BASE_URL}/api/ai/chat"
+    url = f"{_BASE_URL}/api/ai/chat"
     last_error = None
     for attempt in range(_RETRIES + 1):
         try:
-            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
                 r = await client.post(url, json={"user_id": user_id, "prompt": prompt}, headers=_headers())
             if r.status_code == 200:
                 data = r.json()
@@ -51,11 +56,11 @@ async def ai_chat(user_id: int, prompt: str):
 
 async def generate_qr(text: str):
     """Calls POST /api/qr. Returns (png_bytes_or_None, error_message_or_None)."""
-    url = f"{Config.API_BASE_URL}/api/qr"
+    url = f"{_BASE_URL}/api/qr"
     last_error = None
     for attempt in range(_RETRIES + 1):
         try:
-            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
                 r = await client.post(url, json={"text": text}, headers=_headers())
             if r.status_code == 200:
                 return r.content, None
