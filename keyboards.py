@@ -176,16 +176,7 @@ def get_scheduled_list_keyboard(messages):
     for msg in messages:
         status_emoji = "⏳" if msg["status"] == "pending" else "✅" if msg["status"] == "sent" else "❌"
         icon, fmt = get_media_label(msg.get("media_type"))
-        # schedule_time comes back from psycopg2 as a native datetime (Postgres
-        # TIMESTAMP), not a string — string-slicing it crashes. Format properly,
-        # but keep string support for any legacy/cached value.
-        st = msg.get("schedule_time")
-        if not st:
-            time_str = "N/A"
-        elif hasattr(st, "strftime"):
-            time_str = st.strftime("%Y-%m-%d %H:%M")
-        else:
-            time_str = str(st)[:16]
+        time_str = msg["schedule_time"][:16] if msg["schedule_time"] else "N/A"
         buttons.append([
             InlineKeyboardButton(
                 f"{status_emoji} {icon} {fmt} | ID:{msg['id']} | {time_str}",

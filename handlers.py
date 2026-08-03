@@ -4,8 +4,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ChatJoinRequestHandler
 from config import Config
 from database import db
-from ai_handler import ai_handler
-from qr_handler import generate_qr_code
+import api_client
 from keyboards import *
 from scheduler import scheduler
 from datetime import datetime, timedelta, timezone
@@ -561,13 +560,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from keyboards import get_media_label
             icon, fmt = get_media_label(msg.get("media_type"))
             status = "⏳ Pending" if msg["status"] == "pending" else "✅ Sent" if msg["status"] == "sent" else f"❌ {msg['status']}"
-            st = msg.get("schedule_time")
-            if not st:
-                time_str = "N/A"
-            elif hasattr(st, "strftime"):
-                time_str = st.strftime("%Y-%m-%d %H:%M")
-            else:
-                time_str = str(st)[:16]
+            time_str = msg["schedule_time"][:16] if msg["schedule_time"] else "N/A"
             target = str(msg.get('target_type', '?')) + ' -> ' + str(msg.get('target_id', '?'))
             preview = msg.get("media_caption") or msg.get("message_text") or "—"
             if len(preview) > 80:
@@ -1216,7 +1209,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == AI_CHAT:
         await update.message.reply_text("**Soche raha hoon...**", parse_mode="Markdown")
-        response, msg = ai_handler.get_ai_response(user.id, text)
+        response, msg = await api_client.ai_chat(user.id, text)
         if response:
             await update.message.reply_text(f"**AI Response:**\n\n{response}\n\n{msg}", parse_mode="Markdown")
         else:
@@ -1351,8 +1344,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("**Galat format!** Use: `phone|first_name|last_name`", parse_mode="Markdown")
 
     elif state == QR_INPUT:
-        qr_bio = generate_qr_code(text)
-        await update.message.reply_photo(photo=qr_bio, caption="**Aapka QR Code:**")
+        qr_bytes, qr_error = await api_client.generate_qr(text)
+        if qr_error:
+            await update.message.reply_text(qr_error, parse_mode="Markdown")
+        else:
+            await update.message.reply_photo(photo=qr_bytes, caption="**Aapka QR Code:**")
         await update.message.reply_text("**Main Menu:**", reply_markup=get_main_menu(user.id), parse_mode="Markdown")
         context.user_data["state"] = None
 

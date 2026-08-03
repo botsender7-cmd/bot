@@ -6,10 +6,18 @@ load_dotenv()
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     # Neon connection string, e.g.
     # postgresql://user:password@ep-xxxx.region.aws.neon.tech/dbname?sslmode=require
     DATABASE_URL = os.getenv("DATABASE_URL")
+
+    # Base URL of the separately-deployed api.py service.
+    # e.g. https://your-api.onrender.com
+    API_BASE_URL = os.getenv("API_BASE_URL") or f"http://127.0.0.1:{os.getenv('API_PORT', '8000')}"
+
+    # Shared secret with the API service. MUST match API_KEY set there —
+    # every /api/* call from this bot sends it as X-API-Key.
+    API_KEY = os.getenv("API_KEY")
+
     # Default limits
     DEFAULT_AI_LIMIT = 10
     

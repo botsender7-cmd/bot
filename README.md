@@ -1,68 +1,47 @@
----
-title: Telegram Multi-Feature Bot
-emoji: 🤖
-colorFrom: blue
-colorTo: purple
-sdk: docker
-sdk_version: "20.10.0"
-pinned: false
----
+# Telegram Bot (no AI/QR code here) — deploys to Render (webhook mode)
 
-# 🤖 Telegram Multi-Feature Bot
+This service only talks to Telegram + the database directly. AI chat and
+QR code generation are NOT implemented here — both are called over HTTP
+from the separately-deployed API service (`bot-api`, on Vercel).
 
-## Features
-- 🤖 **AI Chat** with Groq API (daily limit set by owner)
-- ✅ **Auto-Approve** join requests for channels/groups
-- 📅 **Message Scheduling** - Text, Photo, Video, Document, Audio, Voice, Video Note, Animation, Sticker, Location, Poll, Contact
-- 📊 **QR Code Generator**
-- 📢 **Channel Force Join** system
-- 👤 **Owner/Admin** management panel
-- 📊 **Bot Statistics**
-- 📝 **Bot Updates** posting
+## Env vars
+- `BOT_TOKEN`, `OWNER_ID`, `DATABASE_URL`
+- `API_BASE_URL` — your Vercel API's URL, e.g. `https://<project>.vercel.app`
+- `API_KEY` — must exactly match `API_KEY` set on the Vercel `bot-api` project
+- `PORT` — set automatically by Render, don't set manually
+- `RENDER_EXTERNAL_URL` — set automatically by Render for Web Services,
+  don't set manually. This is what triggers webhook mode (see bot.py).
 
-## Bot Commands
-- `/start` - Start bot and show main menu
-- `/sidemenu` - Open side menu for quick access
-- `/help` - Open help center
+## Deploy to Render — Web Service (not Background Worker)
+Webhook mode means Telegram sends updates to this service over HTTPS, so
+Render needs to route public traffic to it — that requires the
+**Web Service** type, not Background Worker (which has no public URL).
 
-## Setup Instructions
+1. Create a new Web Service on Render, connect this repo/folder, build
+   with the included `Dockerfile`.
+2. Set the env vars above (`BOT_TOKEN`, `OWNER_ID`, `DATABASE_URL`,
+   `API_BASE_URL`, `API_KEY`). Leave `PORT`/`RENDER_EXTERNAL_URL` alone —
+   Render injects both automatically.
+3. On startup, `bot.py` detects `RENDER_EXTERNAL_URL`, builds
+   `{RENDER_EXTERNAL_URL}/telegram` as the webhook URL, and registers it
+   with Telegram via `run_webhook()`, binding `0.0.0.0:$PORT`.
+4. Check logs for `"Public URL detected - using webhook mode"` and the
+   webhook base URL it registered, to confirm it didn't silently fall
+   back to polling (which happens if `RENDER_EXTERNAL_URL` is missing —
+   shouldn't happen on a real Render Web Service, but worth checking on
+   first deploy).
 
-### 1. Postgres Database Setup
-This bot uses plain Postgres via `DATABASE_URL` (e.g. a free Neon project), not Supabase.
-**Tables are created automatically on startup** — `database.py` reads `schema.sql` and runs it
-(`CREATE TABLE IF NOT EXISTS ...`) every time the bot boots, so a fresh database will self-provision
-on first deploy. If `schema.sql` is missing from the deploy or the auto-create fails for any reason
-(e.g. the DB user lacks CREATE privileges), the bot will refuse to start and log the exact error —
-it will NOT fall back to silently running against a half-missing schema.
+### Note on Render's free tier
+Free Web Services on Render spin down after ~15 min of no inbound HTTP
+traffic and take a few seconds to spin back up on the next request. In
+webhook mode that means Telegram's first update after an idle period may
+be delayed until the container wakes up (Telegram will retry, so it isn't
+usually lost — just delayed). If you need always-on, that's a paid tier.
 
-You can still run it by hand if you prefer:
-```bash
-psql "$DATABASE_URL" -f schema.sql
+## Run locally (polling mode)
 ```
-
-### 2. Environment Variables
-Copy `.env.example` to `.env` and fill in your credentials:
-
-```env
-BOT_TOKEN=your_telegram_bot_token
-OWNER_ID=your_telegram_user_id
-GROQ_API_KEY=your_groq_api_key
-DATABASE_URL=postgresql://user:password@host/dbname?sslmode=require
+pip install -r requirements.txt
+python bot.py
 ```
-
-### 3. Deploy on Render
-1. Push this repo to GitHub.
-2. On Render: **New +** → **Web Service** → connect the repo. Render auto-detects the `Dockerfile`.
-3. Instance type: any (even free tier works, but free tier sleeps on inactivity — see note below).
-4. Set the environment variables above in the Render dashboard (**Environment** tab). Do NOT set `PORT`, `RENDER_EXTERNAL_URL`, or `WEBHOOK_URL` — Render injects these automatically and `bot.py` picks them up.
-5. Deploy. On boot, `bot.py` detects `RENDER_EXTERNAL_URL` and switches itself into webhook mode automatically (`run_webhook`, path `/telegram`). No manual `setWebhook` call needed.
-6. If Render's health check fails on `/`, set the health check path to `/telegram` in the service settings (the app only serves that path, not root).
-
-### 4. Keep Bot Alive
-Render's free tier spins down after inactivity, same idea as before. Use UptimeRobot or a similar pinger against your Render URL if you're on the free tier.
-
-## Important Notes
-1. Bot ko har channel mein **Admin** banaein with "Approve Users" permission
-2. Channel ID format: `-1001234567890`
-3. For auto-approve, enable it from Owner Panel after adding channel
-4. For media scheduling, bot must be admin in target channel/group
+No `RENDER_EXTERNAL_URL`/`WEBHOOK_URL` set locally → falls back to
+polling automatically, no webhook registration needed for local dev.

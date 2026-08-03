@@ -103,29 +103,28 @@ def main():
 
     logger.info("Bot started! Commands: /start, /sidemenu, /help")
 
-    # Railway sets RAILWAY_PUBLIC_DOMAIN automatically when a public port
-    # is exposed (e.g. "yourapp.up.railway.app", no scheme, no trailing slash).
-    # Falls back to RAILWAY_STATIC_URL for older Railway environments.
-    # Render sets RENDER_EXTERNAL_URL automatically (full URL, has scheme
-    # already, e.g. "https://yourapp.onrender.com") - checked separately
-    # below since it's already a full URL, not a bare domain.
-    # WEBHOOK_URL is the manual override for any other host. If none are
-    # set, runs polling instead.
-    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_STATIC_URL")
-    render_url = os.getenv("RENDER_EXTERNAL_URL")  # e.g. https://yourapp.onrender.com
-    webhook_url_env = os.getenv("WEBHOOK_URL")  # e.g. https://yourapp.up.railway.app
+    # Auto-detected public URL, in priority order:
+    # 1. WEBHOOK_URL - explicit manual override, works on any host.
+    # 2. RENDER_EXTERNAL_URL - Render sets this automatically for Web
+    #    Services (full URL incl. https://, e.g. "https://yourapp.onrender.com").
+    # 3. RAILWAY_PUBLIC_DOMAIN / RAILWAY_STATIC_URL - Railway equivalents
+    #    (bare domain, no scheme).
+    # If none are set, falls back to polling mode.
+    webhook_url_env = os.getenv("WEBHOOK_URL")
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_STATIC_URL")
 
     port = int(os.getenv("PORT", 8080))
 
-    if public_domain or render_url or webhook_url_env:
+    if webhook_url_env or render_url or railway_domain:
         if webhook_url_env:
             base_url = webhook_url_env.rstrip("/")
         elif render_url:
             base_url = render_url.rstrip("/")
         else:
-            base_url = f"https://{public_domain}"
+            base_url = f"https://{railway_domain}"
 
-        logger.info("Using webhook mode")
+        logger.info("Public URL detected - using webhook mode")
         logger.info(f"PORT={port}")
         logger.info(f"Webhook base URL: {base_url}")
 
@@ -138,7 +137,7 @@ def main():
             drop_pending_updates=True
         )
     else:
-        logger.info("No public domain detected - using polling mode")
+        logger.info("No public URL detected - using polling mode")
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True

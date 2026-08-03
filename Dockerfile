@@ -20,5 +20,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Railway and Render both inject PORT at runtime; bot.py reads it via os.getenv("PORT", 8080)
+# On Render (Web Service type), Render sets RENDER_EXTERNAL_URL and PORT
+# automatically — bot.py detects RENDER_EXTERNAL_URL and switches to
+# webhook mode, binding 0.0.0.0:$PORT. Falls back to polling if no public
+# URL env var is present (e.g. running locally).
+EXPOSE 8080
 CMD ["python", "bot.py"]
