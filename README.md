@@ -5,7 +5,7 @@ QR code generation are NOT implemented here — both are called over HTTP
 from the separately-deployed API service (`bot-api`, on Vercel).
 
 ## Env vars
-- `BOT_TOKEN`, `OWNER_ID`, `DATABASE_URL`
+- `BOT_TOKEN`, `OWNER_ID`, `MONGODB_URI`
 - `API_BASE_URL` — your Vercel API's URL, e.g. `https://<project>.vercel.app`
 - `API_KEY` — must exactly match `API_KEY` set on the Vercel `bot-api` project
 - `PORT` — set automatically by Render, don't set manually
@@ -19,7 +19,7 @@ Render needs to route public traffic to it — that requires the
 
 1. Create a new Web Service on Render, connect this repo/folder, build
    with the included `Dockerfile`.
-2. Set the env vars above (`BOT_TOKEN`, `OWNER_ID`, `DATABASE_URL`,
+2. Set the env vars above (`BOT_TOKEN`, `OWNER_ID`, `MONGODB_URI`,
    `API_BASE_URL`, `API_KEY`). Leave `PORT`/`RENDER_EXTERNAL_URL` alone —
    Render injects both automatically.
 3. On startup, `bot.py` detects `RENDER_EXTERNAL_URL`, builds

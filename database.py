@@ -1,59 +1,89 @@
-import psycopg2
-import psycopg2.extras
-from psycopg2.pool import ThreadedConnectionPool
-from contextlib import contextmanager
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
 from config import Config
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 
 class Database:
     def __init__(self):
-        self.dsn = Config.DATABASE_URL.strip() if Config.DATABASE_URL else ""
+        self.uri = Config.MONGODB_URI.strip() if Config.MONGODB_URI else ""
 
-        if not self.dsn:
-            raise ValueError("DATABASE_URL is missing! Check your .env or Hugging Face secrets.")
+        if not self.uri:
+            raise ValueError("MONGODB_URI is missing! Check your .env or Hugging Face secrets.")
 
-        print(f"[DEBUG] Connecting to Neon Postgres: {self.dsn.split('@')[-1] if '@' in self.dsn else '(hidden)'}")
+        print(f"[DEBUG] Connecting to MongoDB: {self.uri.split('@')[-1] if '@' in self.uri else '(hidden)'}")
 
-        # Neon free tier: keep the pool small. minconn=1 avoids holding
-        # connections open when the bot is idle; maxconn=5 is plenty for a
-        # single-worker Telegram bot handling requests one at a time.
-        self.pool = ThreadedConnectionPool(1, 5, dsn=self.dsn, sslmode="require")
+        self.client = MongoClient(self.uri, serverSelectionTimeoutMS=10000)
+        self.db = self.client[Config.MONGODB_DB_NAME]
 
-    @contextmanager
-    def _conn(self):
-        conn = self.pool.getconn()
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self.pool.putconn(conn)
+        # Collections
+        self.users = self.db["users"]
+        self.admins = self.db["admins"]
+        self.channels = self.db["channels"]
+        self.ai_usage = self.db["ai_usage"]
+        self.scheduled_messages = self.db["scheduled_messages"]
+        self.join_requests = self.db["join_requests"]
+        self.user_channels = self.db["user_channels"]
+        self.bot_updates = self.db["bot_updates"]
+        self.media_log = self.db["media_log"]
+        self.copyright_reports = self.db["copyright_reports"]
+        self.copyright_strikes = self.db["copyright_strikes"]
+        self.audit_log = self.db["audit_log"]
+        self.counters = self.db["counters"]
 
-    def _query(self, sql, params=None, fetch="all"):
-        """fetch: 'all' | 'one' | 'none'. Returns list[dict] / dict|None / None."""
-        with self._conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                try:
-                    cur.execute(sql, params or ())
-                except Exception as e:
-                    print(f"[DB ERROR] {sql[:100]} -> {e}")
-                    if fetch == "all":
-                        return []
-                    return None
-                if fetch == "none":
-                    return None
-                if fetch == "one":
-                    row = cur.fetchone()
-                    return dict(row) if row else None
-                rows = cur.fetchall()
-                return [dict(r) for r in rows]
+        # Fail fast if the connection string / cluster is unreachable, same
+        # spirit as the old pool creation failing loudly on bad DSNs.
+        self.client.admin.command("ping")
+
+        self._ensure_indexes()
+
+    def _ensure_indexes(self):
+        self.users.create_index("user_id", unique=True)
+        self.admins.create_index("user_id", unique=True)
+        self.channels.create_index("channel_id", unique=True)
+        self.scheduled_messages.create_index("id", unique=True)
+        self.scheduled_messages.create_index("status")
+        self.scheduled_messages.create_index("user_id")
+        self.join_requests.create_index([("channel_id", ASCENDING), ("user_id", ASCENDING)])
+        self.user_channels.create_index("channel_id", unique=True)
+        self.user_channels.create_index("user_id")
+        self.bot_updates.create_index("id", unique=True)
+        self.media_log.create_index("id", unique=True)
+        self.media_log.create_index("message_id")
+        self.media_log.create_index("user_id")
+        self.copyright_reports.create_index("id", unique=True)
+        self.copyright_strikes.create_index("user_id")
+        self.audit_log.create_index("target_user_id")
+
+    # ========== INTERNAL HELPERS ==========
+    def _next_id(self, name):
+        """Mongo has no SERIAL/auto-increment column, so integer ids (needed
+        because Telegram callback_data parses them back with int()) are
+        handed out from a counters collection instead of relying on _id."""
+        doc = self.counters.find_one_and_update(
+            {"_id": name},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document=True
+        )
+        return doc["seq"]
+
+    @staticmethod
+    def _clean(doc):
+        """Strip Mongo's internal _id (ObjectId isn't used anywhere downstream
+        and isn't JSON-serializable) so callers get plain dicts like before."""
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        return doc
+
+    @classmethod
+    def _clean_many(cls, docs):
+        return [cls._clean(d) for d in docs]
 
     # ========== USERS ==========
     def get_user(self, user_id):
-        return self._query("SELECT * FROM users WHERE user_id = %s", (user_id,), fetch="one")
+        return self._clean(self.users.find_one({"user_id": user_id}))
 
     def create_user(self, user_id, username, first_name):
         data = {
@@ -65,68 +95,71 @@ class Database:
             "last_ai_request_date": str(date.today()),
             "is_banned": False
         }
-        self._query(
-            """INSERT INTO users (user_id, username, first_name, created_at, ai_requests_today, last_ai_request_date, is_banned)
-               VALUES (%(user_id)s, %(username)s, %(first_name)s, %(created_at)s, %(ai_requests_today)s, %(last_ai_request_date)s, %(is_banned)s)
-               ON CONFLICT (user_id) DO NOTHING""",
-            data, fetch="none"
-        )
+        try:
+            self.users.insert_one(dict(data))
+        except DuplicateKeyError:
+            pass
         return data
 
     def update_user_ai_usage(self, user_id):
         today = str(date.today())
         user = self.get_user(user_id)
         if user and user.get("last_ai_request_date") == today:
-            self._query(
-                "UPDATE users SET ai_requests_today = %s WHERE user_id = %s",
-                (user["ai_requests_today"] + 1, user_id), fetch="none"
+            self.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"ai_requests_today": user["ai_requests_today"] + 1}}
             )
         else:
-            self._query(
-                "UPDATE users SET ai_requests_today = 1, last_ai_request_date = %s WHERE user_id = %s",
-                (today, user_id), fetch="none"
+            self.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"ai_requests_today": 1, "last_ai_request_date": today}}
             )
 
     def reset_ai_usage(self, user_id):
-        self._query(
-            "UPDATE users SET ai_requests_today = 0, last_ai_request_date = %s WHERE user_id = %s",
-            (str(date.today()), user_id), fetch="none"
+        self.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"ai_requests_today": 0, "last_ai_request_date": str(date.today())}}
         )
 
     def get_all_users(self):
-        return self._query("SELECT * FROM users")
+        return self._clean_many(self.users.find())
 
     def set_default_ai_limit(self, limit):
         """Updates ai_limit for all non-owner users who still have the default limit."""
-        self._query(
-            "UPDATE users SET ai_limit = %s WHERE ai_limit = %s OR ai_limit IS NULL",
-            (limit, Config.DEFAULT_AI_LIMIT), fetch="none"
+        self.users.update_many(
+            {"$or": [{"ai_limit": Config.DEFAULT_AI_LIMIT}, {"ai_limit": None}, {"ai_limit": {"$exists": False}}]},
+            {"$set": {"ai_limit": limit}}
         )
         Config.DEFAULT_AI_LIMIT = limit
 
+    def set_user_ai_limit(self, user_id, limit):
+        """Sets a single user's ai_limit. Replaces the old dead `db._patch(...)`
+        call (leftover from a pre-Postgres Supabase/PostgREST implementation)
+        that the owner-panel 'set user AI limit' flow was silently failing on."""
+        self.users.update_one({"user_id": user_id}, {"$set": {"ai_limit": limit}})
+
     # ========== ADMINS ==========
     def get_admin(self, user_id):
-        return self._query("SELECT * FROM admins WHERE user_id = %s", (user_id,), fetch="one")
+        return self._clean(self.admins.find_one({"user_id": user_id}))
 
     def add_admin(self, user_id, added_by):
         data = {"user_id": user_id, "added_by": added_by, "created_at": datetime.utcnow()}
-        self._query(
-            """INSERT INTO admins (user_id, added_by, created_at) VALUES (%(user_id)s, %(added_by)s, %(created_at)s)
-               ON CONFLICT (user_id) DO NOTHING""",
-            data, fetch="none"
-        )
+        try:
+            self.admins.insert_one(dict(data))
+        except DuplicateKeyError:
+            pass
         return data
 
     def remove_admin(self, user_id):
-        self._query("DELETE FROM admins WHERE user_id = %s", (user_id,), fetch="none")
+        self.admins.delete_one({"user_id": user_id})
         return True
 
     def get_all_admins(self):
-        return self._query("SELECT * FROM admins")
+        return self._clean_many(self.admins.find())
 
     # ========== CHANNELS ==========
     def get_channel(self, channel_id):
-        return self._query("SELECT * FROM channels WHERE channel_id = %s", (channel_id,), fetch="one")
+        return self._clean(self.channels.find_one({"channel_id": channel_id}))
 
     def add_channel(self, channel_id, channel_name, invite_link, added_by, auto_approve=False):
         data = {
@@ -137,81 +170,103 @@ class Database:
             "auto_approve": auto_approve,
             "created_at": datetime.utcnow()
         }
-        self._query(
-            """INSERT INTO channels (channel_id, channel_name, invite_link, added_by, auto_approve, created_at)
-               VALUES (%(channel_id)s, %(channel_name)s, %(invite_link)s, %(added_by)s, %(auto_approve)s, %(created_at)s)
-               ON CONFLICT (channel_id) DO UPDATE SET channel_name = EXCLUDED.channel_name,
-                   invite_link = EXCLUDED.invite_link, auto_approve = EXCLUDED.auto_approve""",
-            data, fetch="none"
+        self.channels.update_one(
+            {"channel_id": channel_id},
+            {
+                "$set": {
+                    "channel_name": channel_name,
+                    "invite_link": invite_link,
+                    "auto_approve": auto_approve
+                },
+                "$setOnInsert": {
+                    "channel_id": channel_id,
+                    "added_by": added_by,
+                    "created_at": data["created_at"]
+                }
+            },
+            upsert=True
         )
         return data
 
     def update_channel_invite_link(self, channel_id, invite_link):
-        self._query("UPDATE channels SET invite_link = %s WHERE channel_id = %s", (invite_link, channel_id), fetch="none")
+        self.channels.update_one({"channel_id": channel_id}, {"$set": {"invite_link": invite_link}})
 
     def remove_channel(self, channel_id):
-        self._query("DELETE FROM channels WHERE channel_id = %s", (channel_id,), fetch="none")
+        self.channels.delete_one({"channel_id": channel_id})
         return True
 
     def get_all_channels(self):
-        return self._query("SELECT * FROM channels")
+        return self._clean_many(self.channels.find())
 
     def update_channel_auto_approve(self, channel_id, auto_approve):
-        self._query("UPDATE channels SET auto_approve = %s WHERE channel_id = %s", (auto_approve, channel_id), fetch="none")
+        self.channels.update_one({"channel_id": channel_id}, {"$set": {"auto_approve": auto_approve}})
 
     # ========== AI USAGE LOG ==========
     def log_ai_request(self, user_id, prompt, response):
-        self._query(
-            "INSERT INTO ai_usage (user_id, prompt, response, created_at) VALUES (%s, %s, %s, %s)",
-            (user_id, prompt, response, datetime.utcnow()), fetch="none"
-        )
+        self.ai_usage.insert_one({
+            "user_id": user_id,
+            "prompt": prompt,
+            "response": response,
+            "created_at": datetime.utcnow()
+        })
 
     # ========== SCHEDULED MESSAGES ==========
     def add_scheduled_message(self, user_id, target_type, target_id, message_text, schedule_time,
                                media_type=None, media_file_id=None, media_caption=None,
                                reply_markup_json=None):
-        row = self._query(
-            """INSERT INTO scheduled_messages
-               (user_id, target_type, target_id, message_text, media_type, media_file_id,
-                media_caption, reply_markup_json, schedule_time, status, created_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s)
-               RETURNING *""",
-            (user_id, target_type, target_id, message_text, media_type, media_file_id,
-             media_caption, reply_markup_json, schedule_time, datetime.utcnow()),
-            fetch="one"
-        )
-        return row
+        data = {
+            "id": self._next_id("scheduled_messages"),
+            "user_id": user_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "message_text": message_text,
+            "media_type": media_type,
+            "media_file_id": media_file_id,
+            "media_caption": media_caption,
+            "reply_markup_json": reply_markup_json,
+            "schedule_time": schedule_time,
+            "status": "pending",
+            "created_at": datetime.utcnow()
+        }
+        self.scheduled_messages.insert_one(dict(data))
+        return data
 
     def get_pending_messages(self):
-        return self._query("SELECT * FROM scheduled_messages WHERE status = 'pending'")
+        return self._clean_many(self.scheduled_messages.find({"status": "pending"}))
 
     def update_message_status(self, msg_id, status):
-        self._query("UPDATE scheduled_messages SET status = %s WHERE id = %s", (status, msg_id), fetch="none")
+        self.scheduled_messages.update_one({"id": msg_id}, {"$set": {"status": status}})
 
     def get_user_scheduled_messages(self, user_id):
-        return self._query("SELECT * FROM scheduled_messages WHERE user_id = %s", (user_id,))
+        return self._clean_many(self.scheduled_messages.find({"user_id": user_id}))
 
     def get_scheduled_message_by_id(self, msg_id):
         """Looks up a scheduled message by its own id, regardless of owner.
         Needed for copyright reports filed against someone else's schedule."""
-        return self._query("SELECT * FROM scheduled_messages WHERE id = %s", (msg_id,), fetch="one")
+        return self._clean(self.scheduled_messages.find_one({"id": msg_id}))
 
     def delete_scheduled_message(self, msg_id):
-        self._query("DELETE FROM scheduled_messages WHERE id = %s", (msg_id,), fetch="none")
+        self.scheduled_messages.delete_one({"id": msg_id})
         return True
+
+    def delete_old_sent_messages(self, older_than_hours=24):
+        """Delete sent scheduled messages older than `older_than_hours`.
+        Was called from scheduler.py's daily cleanup job but never existed
+        on the old Database class, so the job silently failed every run."""
+        cutoff = datetime.utcnow() - timedelta(hours=older_than_hours)
+        self.scheduled_messages.delete_many({"status": "sent", "schedule_time": {"$lt": cutoff}})
 
     # ========== JOIN REQUESTS ==========
     def log_join_request(self, channel_id, user_id, status):
-        self._query(
-            "INSERT INTO join_requests (channel_id, user_id, status, created_at) VALUES (%s, %s, %s, %s)",
-            (channel_id, user_id, status, datetime.utcnow()), fetch="none"
-        )
+        self.join_requests.insert_one({
+            "channel_id": channel_id,
+            "user_id": user_id,
+            "status": status,
+            "created_at": datetime.utcnow()
+        })
 
     def get_join_request(self, channel_id, user_id):
-        return self._query(
-            "SELECT * FROM join_requests WHERE channel_id = %s AND user_id = %s",
-            (channel_id, user_id), fetch="one"
-        )
+        return self._clean(self.join_requests.find_one({"channel_id": channel_id, "user_id": user_id}))
 
     def save_join_request(self, user_id, channel_id):
         if self.has_join_request(user_id, channel_id):
@@ -223,18 +278,11 @@ class Database:
             "status": "verified",
             "created_at": datetime.utcnow()
         }
-        self._query(
-            "INSERT INTO join_requests (user_id, channel_id, status, created_at) VALUES (%(user_id)s, %(channel_id)s, %(status)s, %(created_at)s)",
-            data, fetch="none"
-        )
+        self.join_requests.insert_one(dict(data))
         return data
 
     def has_join_request(self, user_id, channel_id):
-        rows = self._query(
-            "SELECT 1 FROM join_requests WHERE user_id = %s AND channel_id = %s",
-            (user_id, channel_id)
-        )
-        return len(rows) > 0
+        return self.join_requests.count_documents({"user_id": user_id, "channel_id": channel_id}, limit=1) > 0
 
     def add_user_channel(self, user_id, channel_id, channel_name):
         data = {
@@ -244,39 +292,39 @@ class Database:
             "auto_approve": True,
             "created_at": datetime.utcnow()
         }
-        return self._query(
-            """INSERT INTO user_channels (user_id, channel_id, channel_name, auto_approve, created_at)
-               VALUES (%(user_id)s, %(channel_id)s, %(channel_name)s, %(auto_approve)s, %(created_at)s)
-               RETURNING *""",
-            data, fetch="one"
-        )
+        self.user_channels.insert_one(dict(data))
+        return data
 
     def get_user_channel(self, channel_id):
-        return self._query("SELECT * FROM user_channels WHERE channel_id = %s", (channel_id,), fetch="one")
+        return self._clean(self.user_channels.find_one({"channel_id": channel_id}))
 
     def get_user_channels(self, user_id):
-        return self._query("SELECT * FROM user_channels WHERE user_id = %s", (user_id,))
+        return self._clean_many(self.user_channels.find({"user_id": user_id}))
 
     def remove_user_channel(self, channel_id):
-        self._query("DELETE FROM user_channels WHERE channel_id = %s", (channel_id,), fetch="none")
+        self.user_channels.delete_one({"channel_id": channel_id})
         return True
 
     def toggle_auto_approve(self, channel_id, state):
-        self._query("UPDATE user_channels SET auto_approve = %s WHERE channel_id = %s", (state, channel_id), fetch="none")
+        self.user_channels.update_one({"channel_id": channel_id}, {"$set": {"auto_approve": state}})
 
     # ========== BOT UPDATES ==========
     def add_bot_update(self, title, message, added_by):
-        return self._query(
-            """INSERT INTO bot_updates (title, message, added_by, created_at)
-               VALUES (%s, %s, %s, %s) RETURNING *""",
-            (title, message, added_by, datetime.utcnow()), fetch="one"
-        )
+        data = {
+            "id": self._next_id("bot_updates"),
+            "title": title,
+            "message": message,
+            "added_by": added_by,
+            "created_at": datetime.utcnow()
+        }
+        self.bot_updates.insert_one(dict(data))
+        return data
 
     def get_all_updates(self):
-        return self._query("SELECT * FROM bot_updates ORDER BY created_at DESC")
+        return self._clean_many(self.bot_updates.find().sort("created_at", DESCENDING))
 
     def delete_update(self, update_id):
-        self._query("DELETE FROM bot_updates WHERE id = %s", (update_id,), fetch="none")
+        self.bot_updates.delete_one({"id": update_id})
         return True
 
     # ========== COPYRIGHT: BAN / RESTRICTION CHECKS ==========
@@ -304,92 +352,108 @@ class Database:
         return None
 
     def set_user_banned(self, user_id, banned=True):
-        self._query("UPDATE users SET is_banned = %s WHERE user_id = %s", (banned, user_id), fetch="none")
+        self.users.update_one({"user_id": user_id}, {"$set": {"is_banned": banned}})
 
     def set_user_restricted_until(self, user_id, until_dt):
         """Pass None to clear the restriction."""
-        self._query("UPDATE users SET restricted_until = %s WHERE user_id = %s", (until_dt, user_id), fetch="none")
+        self.users.update_one({"user_id": user_id}, {"$set": {"restricted_until": until_dt}})
 
     def has_acknowledged_copyright_warning(self, user_id):
         user = self.get_user(user_id)
         return bool(user and user.get("copyright_warning_ack"))
 
     def set_copyright_warning_acknowledged(self, user_id):
-        self._query("UPDATE users SET copyright_warning_ack = TRUE WHERE user_id = %s", (user_id,), fetch="none")
+        self.users.update_one({"user_id": user_id}, {"$set": {"copyright_warning_ack": True}})
 
     # ========== COPYRIGHT: MEDIA LOG ==========
     def log_scheduled_media(self, user_id, file_id, message_id, media_type, schedule_time, upload_date=None):
         """Records every scheduled copyright-relevant media item for moderation lookup.
         message_id here is the scheduled_messages.id (the schedule's own DB id),
         since the original Telegram message_id isn't retained anywhere upstream."""
-        row = self._query(
-            """INSERT INTO media_log (user_id, file_id, message_id, media_type, schedule_time, upload_date, strike_status, created_at)
-               VALUES (%s, %s, %s, %s, %s, %s, 'none', %s) RETURNING *""",
-            (user_id, file_id, message_id, media_type, schedule_time, upload_date or datetime.utcnow(), datetime.utcnow()),
-            fetch="one"
-        )
-        return row
+        data = {
+            "id": self._next_id("media_log"),
+            "user_id": user_id,
+            "file_id": file_id,
+            "message_id": message_id,
+            "media_type": media_type,
+            "schedule_time": schedule_time,
+            "upload_date": upload_date or datetime.utcnow(),
+            "strike_status": "none",
+            "created_at": datetime.utcnow()
+        }
+        self.media_log.insert_one(dict(data))
+        return data
 
     def get_media_log_entry(self, log_id):
-        return self._query("SELECT * FROM media_log WHERE id = %s", (log_id,), fetch="one")
+        return self._clean(self.media_log.find_one({"id": log_id}))
 
     def get_media_log_by_schedule_id(self, schedule_message_id):
-        return self._query("SELECT * FROM media_log WHERE message_id = %s", (schedule_message_id,), fetch="one")
+        return self._clean(self.media_log.find_one({"message_id": schedule_message_id}))
 
     def get_user_media_log(self, user_id):
-        return self._query("SELECT * FROM media_log WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+        return self._clean_many(self.media_log.find({"user_id": user_id}).sort("created_at", DESCENDING))
 
     def mark_media_log_status(self, log_id, status):
         """status: 'none' | 'flagged' | 'removed' | 'infringing'"""
-        self._query("UPDATE media_log SET strike_status = %s WHERE id = %s", (status, log_id), fetch="none")
+        self.media_log.update_one({"id": log_id}, {"$set": {"strike_status": status}})
 
     # ========== COPYRIGHT: REPORTS ==========
     def create_copyright_report(self, reporter_id, reported_user_id, scheduled_message_id, reason):
-        return self._query(
-            """INSERT INTO copyright_reports (reporter_id, reported_user_id, scheduled_message_id, reason, status, created_at)
-               VALUES (%s, %s, %s, %s, 'open', %s) RETURNING *""",
-            (reporter_id, reported_user_id, scheduled_message_id, reason, datetime.utcnow()), fetch="one"
-        )
+        data = {
+            "id": self._next_id("copyright_reports"),
+            "reporter_id": reporter_id,
+            "reported_user_id": reported_user_id,
+            "scheduled_message_id": scheduled_message_id,
+            "reason": reason,
+            "status": "open",
+            "created_at": datetime.utcnow()
+        }
+        self.copyright_reports.insert_one(dict(data))
+        return data
 
     def get_all_reports(self):
-        return self._query("SELECT * FROM copyright_reports ORDER BY created_at DESC")
+        return self._clean_many(self.copyright_reports.find().sort("created_at", DESCENDING))
 
     def get_report(self, report_id):
-        return self._query("SELECT * FROM copyright_reports WHERE id = %s", (report_id,), fetch="one")
+        return self._clean(self.copyright_reports.find_one({"id": report_id}))
 
     def update_report_status(self, report_id, status):
-        self._query("UPDATE copyright_reports SET status = %s WHERE id = %s", (status, report_id), fetch="none")
+        self.copyright_reports.update_one({"id": report_id}, {"$set": {"status": status}})
 
     # ========== COPYRIGHT: STRIKES ==========
     def get_user_strike_count(self, user_id):
-        rows = self._query("SELECT 1 FROM copyright_strikes WHERE user_id = %s", (user_id,))
-        return len(rows) if rows else 0
+        return self.copyright_strikes.count_documents({"user_id": user_id})
 
     def add_strike(self, user_id, reason, added_by):
-        self._query(
-            "INSERT INTO copyright_strikes (user_id, reason, added_by, created_at) VALUES (%s, %s, %s, %s)",
-            (user_id, reason, added_by, datetime.utcnow()), fetch="none"
-        )
+        self.copyright_strikes.insert_one({
+            "user_id": user_id,
+            "reason": reason,
+            "added_by": added_by,
+            "created_at": datetime.utcnow()
+        })
         return self.get_user_strike_count(user_id)
 
     def get_user_strikes(self, user_id):
-        return self._query("SELECT * FROM copyright_strikes WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+        return self._clean_many(self.copyright_strikes.find({"user_id": user_id}).sort("created_at", DESCENDING))
 
     def reset_strikes(self, user_id):
-        self._query("DELETE FROM copyright_strikes WHERE user_id = %s", (user_id,), fetch="none")
+        self.copyright_strikes.delete_many({"user_id": user_id})
 
     # ========== COPYRIGHT: AUDIT LOG ==========
     def add_audit_log(self, action_type, actor_id, target_user_id, details=""):
-        self._query(
-            "INSERT INTO audit_log (action_type, actor_id, target_user_id, details, created_at) VALUES (%s, %s, %s, %s, %s)",
-            (action_type, actor_id, target_user_id, details, datetime.utcnow()), fetch="none"
-        )
+        self.audit_log.insert_one({
+            "action_type": action_type,
+            "actor_id": actor_id,
+            "target_user_id": target_user_id,
+            "details": details,
+            "created_at": datetime.utcnow()
+        })
 
     def get_audit_log(self, limit=50):
-        return self._query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT %s", (limit,))
+        return self._clean_many(self.audit_log.find().sort("created_at", DESCENDING).limit(limit))
 
     def get_user_audit_log(self, user_id):
-        return self._query("SELECT * FROM audit_log WHERE target_user_id = %s ORDER BY created_at DESC", (user_id,))
+        return self._clean_many(self.audit_log.find({"target_user_id": user_id}).sort("created_at", DESCENDING))
 
 
 db = Database()

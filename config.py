@@ -6,9 +6,10 @@ load_dotenv()
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-    # Neon connection string, e.g.
-    # postgresql://user:password@ep-xxxx.region.aws.neon.tech/dbname?sslmode=require
-    DATABASE_URL = os.getenv("DATABASE_URL")
+    # MongoDB connection string, e.g.
+    # mongodb+srv://user:password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority
+    MONGODB_URI = os.getenv("MONGODB_URI")
+    MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "telegram_bot")
 
     # Base URL of the separately-deployed api.py service.
     # e.g. https://your-api.onrender.com

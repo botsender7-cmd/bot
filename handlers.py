@@ -1625,7 +1625,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parts = text.split("|")
             target_user_id = int(parts[0].strip())
             limit = int(parts[1].strip())
-            db._patch(Config.TABLE_USERS, {"ai_limit": limit}, {"user_id": f"eq.{target_user_id}"})
+            db.set_user_ai_limit(target_user_id, limit)
             await update.message.reply_text(f"**User {target_user_id} ka AI limit {limit} set ho gaya!**", reply_markup=get_owner_panel(), parse_mode="Markdown")
         except Exception as e:
             await update.message.reply_text(f"**Error:** {str(e)}\n\nFormat: `user_id|limit`", reply_markup=get_owner_panel(), parse_mode="Markdown")
