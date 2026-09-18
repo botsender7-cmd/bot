@@ -34,6 +34,35 @@ class Config:
     TABLE_JOIN_REQUESTS = "join_requests"
     TABLE_BOT_UPDATES = "bot_updates"
 
+    # ===== Audio Vault (owner-only shareable audio links) =====
+    # Replaces the old standalone bot's store.json. All batch state now
+    # lives in MongoDB so it survives container restarts (Render's disk is
+    # ephemeral — a JSON file there is lost on every deploy).
+    TABLE_AUDIO_BATCHES = "audio_batches"
+
+    # Preset expiry buttons shown to the owner after "Done".
+    # label -> seconds (None = never expires)
+    AUDIO_EXPIRY_OPTIONS = {
+        "1 Hour": 60 * 60,
+        "6 Hours": 6 * 60 * 60,
+        "1 Day": 24 * 60 * 60,
+        "7 Days": 7 * 24 * 60 * 60,
+        "No Expiry": None,
+    }
+
+    # Length of the random share key. The old bot used uuid4().hex[:6]
+    # (24 bits) — small enough to brute-force, and these links are the
+    # only access control on the audio. 12 url-safe chars is ~72 bits.
+    AUDIO_KEY_BYTES = 9
+
+    # An unfinished upload batch (owner sent audio but never pressed Done)
+    # is garbage-collected after this many seconds by the same TTL index.
+    AUDIO_DRAFT_TTL_SECONDS = 24 * 60 * 60
+
+    # How long delivered audio messages stay in the recipient's chat
+    # before the bot deletes them. 0 disables auto-delete.
+    AUDIO_AUTODELETE_SECONDS = 300
+
     # ===== Copyright Protection System =====
     TABLE_MEDIA_LOG = "media_log"
     TABLE_COPYRIGHT_STRIKES = "copyright_strikes"

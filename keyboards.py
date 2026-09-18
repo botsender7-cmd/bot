@@ -45,6 +45,7 @@ def get_owner_panel():
         [InlineKeyboardButton("👥 Admin List", callback_data="admin_list")],
         [InlineKeyboardButton("📝 Post Update", callback_data="post_update")],
         [InlineKeyboardButton("🛡️ Moderation Panel", callback_data="moderation_panel")],
+        [InlineKeyboardButton("🎵 Audio Vault", callback_data="audio_menu")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(buttons)
@@ -229,6 +230,56 @@ def get_ai_limit_keybord():
         [InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]
     ]
     return InlineKeyboardMarkup(buttons)
+
+# ========== AUDIO VAULT (owner only) ==========
+
+def get_audio_menu_keyboard():
+    buttons = [
+        [InlineKeyboardButton("⬆️ Naya Batch Upload", callback_data="audio_upload")],
+        [InlineKeyboardButton("📂 Mere Links", callback_data="audio_list")],
+        [InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_audio_upload_keyboard(file_count):
+    """Shown while the owner is sending audio files into a draft batch."""
+    buttons = []
+    if file_count:
+        buttons.append([InlineKeyboardButton(f"✅ Done ({file_count})", callback_data="audio_done")])
+    buttons.append([InlineKeyboardButton("🗑️ Cancel Batch", callback_data="audio_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_audio_expiry_keyboard():
+    """Preset expiry choices. Free-text durations still work — the owner can
+    just type '45m' / '2h30m' / 'never' instead of tapping a button."""
+    labels = list(Config.AUDIO_EXPIRY_OPTIONS.keys())
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"audio_exp_{i}")
+         for i, label in enumerate(labels[row:row + 2], start=row)]
+        for row in range(0, len(labels), 2)
+    ]
+    buttons.append([InlineKeyboardButton("🗑️ Cancel Batch", callback_data="audio_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_audio_list_keyboard(batches):
+    buttons = []
+    for b in batches:
+        label = f"{len(b.get('files', []))} file(s) • {b['key']}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"audio_detail_{b['key']}")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="audio_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_audio_detail_keyboard(key):
+    buttons = [
+        [InlineKeyboardButton("🗑️ Delete Link", callback_data=f"audio_del_{key}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="audio_list")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
 
 # ========== COPYRIGHT PROTECTION SYSTEM ==========
 

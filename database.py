@@ -30,6 +30,7 @@ class Database:
         self.copyright_strikes = self.db["copyright_strikes"]
         self.audit_log = self.db["audit_log"]
         self.counters = self.db["counters"]
+        self.audio_batches = self.db[Config.TABLE_AUDIO_BATCHES]
 
         # Fail fast if the connection string / cluster is unreachable, same
         # spirit as the old pool creation failing loudly on bad DSNs.
@@ -54,6 +55,23 @@ class Database:
         self.copyright_reports.create_index("id", unique=True)
         self.copyright_strikes.create_index("user_id")
         self.audit_log.create_index("target_user_id")
+
+        # ----- Audio Vault -----
+        self.audio_batches.create_index("key", unique=True)
+        self.audio_batches.create_index([("owner_id", ASCENDING), ("status", ASCENDING)])
+        # TTL index: Mongo deletes the document once `expires_at` passes.
+        # This is what replaces the old bot's CLEANUP_INTERVAL_SECONDS job.
+        # Documents where expires_at is None (or absent) are IGNORED by TTL,
+        # which is exactly the "No Expiry" case — no special handling needed.
+        # Caveat: the TTL monitor only runs about once a minute, so code
+        # that reads a batch must still check expiry itself (see
+        # get_audio_batch) rather than trusting the document's existence.
+        try:
+            self.audio_batches.create_index("expires_at", expireAfterSeconds=0)
+        except Exception as e:
+            # Shared/free Atlas tiers occasionally refuse index creation;
+            # the feature still works, just without automatic purging.
+            print(f"[WARN] audio_batches TTL index not created: {e}")
 
     # ========== INTERNAL HELPERS ==========
     def _next_id(self, name):
@@ -438,6 +456,76 @@ class Database:
 
     def reset_strikes(self, user_id):
         self.copyright_strikes.delete_many({"user_id": user_id})
+
+    # ========== AUDIO VAULT ==========
+    # Document shape (replaces the old store.json entries):
+    # {
+    #   "key": "<url-safe share key>",
+    #   "owner_id": <int>,
+    #   "status": "draft" | "ready",
+    #   "files": [{"file_id": ..., "title": ...}, ...],
+    #   "expires_at": <datetime UTC> or None,
+    #   "created_at": <datetime UTC>
+    # }
+    # All datetimes are naive UTC, matching the rest of this codebase.
+
+    def create_audio_batch(self, key, owner_id, draft_expires_at):
+        """Starts a new draft batch. draft_expires_at makes abandoned drafts
+        self-clean via the TTL index; it is overwritten on finalize."""
+        self.audio_batches.insert_one({
+            "key": key,
+            "owner_id": owner_id,
+            "status": "draft",
+            "files": [],
+            "expires_at": draft_expires_at,
+            "created_at": datetime.utcnow()
+        })
+
+    def get_draft_audio_batch(self, owner_id):
+        """The owner's in-progress batch. Stored in Mongo rather than
+        context.user_data so a restart mid-upload doesn't lose the files."""
+        return self._clean(self.audio_batches.find_one(
+            {"owner_id": owner_id, "status": "draft"},
+            sort=[("created_at", DESCENDING)]
+        ))
+
+    def append_audio_file(self, key, file_id, title):
+        """Atomic push — avoids the read-modify-write race the old
+        save_store() had when several audio files arrived at once."""
+        doc = self.audio_batches.find_one_and_update(
+            {"key": key},
+            {"$push": {"files": {"file_id": file_id, "title": title}}},
+            return_document=True
+        )
+        return self._clean(doc)
+
+    def finalize_audio_batch(self, key, expires_at):
+        """Marks a draft ready and sets its real expiry (None = never)."""
+        self.audio_batches.update_one(
+            {"key": key},
+            {"$set": {"status": "ready", "expires_at": expires_at}}
+        )
+
+    def get_audio_batch(self, key):
+        """Returns the batch, or None if missing/expired. Expiry is checked
+        here too because Mongo's TTL sweep lags by up to ~60 seconds."""
+        doc = self.audio_batches.find_one({"key": key})
+        if not doc:
+            return None
+        exp = doc.get("expires_at")
+        if exp is not None and datetime.utcnow() >= exp:
+            self.audio_batches.delete_one({"key": key})
+            return None
+        return self._clean(doc)
+
+    def delete_audio_batch(self, key):
+        return self.audio_batches.delete_one({"key": key}).deleted_count > 0
+
+    def list_audio_batches(self, owner_id, limit=20):
+        return self._clean_many(
+            self.audio_batches.find({"owner_id": owner_id, "status": "ready"})
+            .sort("created_at", DESCENDING).limit(limit)
+        )
 
     # ========== COPYRIGHT: AUDIT LOG ==========
     def add_audit_log(self, action_type, actor_id, target_user_id, details=""):

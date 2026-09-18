@@ -1,5 +1,7 @@
 import re
 import json
+import secrets
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ChatJoinRequestHandler
 from config import Config
@@ -7,7 +9,7 @@ from database import db
 import api_client
 from keyboards import *
 from scheduler import scheduler
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 
 USER_CHANNEL_ADD = 999
 
@@ -18,7 +20,8 @@ USER_CHANNEL_ADD = 999
  SCHEDULE_CONTACT, SCHEDULE_LOCATION,
  SET_DEFAULT_AI_LIMIT, SET_USER_AI_LIMIT, UPDATE_INVITE_LINK, SCHEDULE_DATE, SCHEDULE_AMPM,
  REPORT_REASON, MOD_BAN_INPUT, MOD_UNBAN_INPUT, MOD_RESET_STRIKES_INPUT,
- MOD_USER_HISTORY_INPUT) = range(26)
+ MOD_USER_HISTORY_INPUT,
+ AUDIO_UPLOAD, AUDIO_EXPIRY) = range(28)
 
 # ========== HELPER FUNCTIONS ==========
 
@@ -132,8 +135,200 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def is_owner(user_id):
     return user_id == Config.OWNER_ID
 
+
+def check_ai_limit(user_id):
+    """Daily AI-chat limit check. This used to live in the API's
+    ai_handler.py, but the API is now stateless/unlimited, so it's
+    enforced here instead using the bot's own MongoDB user record.
+    Returns (allowed: bool, limit_message_if_blocked: str|None)."""
+    user = db.get_user(user_id)
+    if not user:
+        db.create_user(user_id, None, None)
+        user = db.get_user(user_id)
+
+    today = str(date.today())
+    if user.get("last_ai_request_date") != today:
+        db.reset_ai_usage(user_id)
+        user = db.get_user(user_id)
+
+    if is_owner(user_id):
+        return True, None
+
+    ai_limit = user.get("ai_limit") or Config.DEFAULT_AI_LIMIT
+    if user.get("ai_requests_today", 0) >= ai_limit:
+        return False, f"❌ Aapka daily AI limit ({ai_limit} requests) khatam ho gaya hai. Kal try karein!"
+    return True, None
+
 def is_admin(user_id):
     return db.get_admin(user_id) is not None or is_owner(user_id)
+
+# ========== AUDIO VAULT — HELPERS ==========
+# Port of the old standalone audio bot. Two behavioural differences worth
+# knowing:
+#   1. store.json is gone — everything is in Mongo (audio_batches).
+#   2. The APScheduler/JobQueue cleanup loop is gone — a Mongo TTL index
+#      on `expires_at` purges expired batches instead.
+# Owner-only applies to CREATING and MANAGING links. Redeeming a link
+# (/start <key>) is deliberately open to everyone — an owner-only share
+# link would have no one to share with.
+
+# Matches "45m", "2h", "3d", "1w", "1d12h", "2h30m" (case-insensitive).
+_DURATION_RE = re.compile(r"(\d+)\s*(w|d|h|m|s)", re.IGNORECASE)
+_NEVER_WORDS = {"never", "no expiry", "no", "forever", "unlimited", "kabhi nahi"}
+
+
+def parse_audio_duration(text):
+    """Free-text duration -> seconds, or None for 'never expires'.
+    Raises ValueError when the text can't be understood."""
+    cleaned = (text or "").strip().lower()
+    if cleaned in _NEVER_WORDS:
+        return None
+
+    matches = _DURATION_RE.findall(cleaned)
+    if not matches:
+        raise ValueError(f"Could not parse duration: {text!r}")
+
+    unit_seconds = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    total = sum(int(value) * unit_seconds[unit] for value, unit in matches)
+    if total <= 0:
+        raise ValueError(f"Duration must be positive: {text!r}")
+    return total
+
+
+def _new_audio_key():
+    """Collision-resistant share key. The old bot used uuid4().hex[:6]
+    (24 bits); since the key IS the access control for the audio, that was
+    brute-forceable. The unique index on `key` is the real guarantee — this
+    retry loop just avoids surfacing a DuplicateKeyError to the owner."""
+    for _ in range(5):
+        key = secrets.token_urlsafe(Config.AUDIO_KEY_BYTES)
+        if not db.audio_batches.find_one({"key": key}, {"_id": 1}):
+            return key
+    raise RuntimeError("Could not allocate a unique audio key")
+
+
+def _extract_audio(message):
+    """Accepts audio, voice, and documents whose mime type is audio/*."""
+    doc = message.document
+    return message.audio or message.voice or (
+        doc if doc and doc.mime_type and doc.mime_type.startswith("audio") else None
+    )
+
+
+def _format_expiry(expires_at):
+    if expires_at is None:
+        return "⚠️ Ye link kabhi expire nahi hoga."
+    remaining = expires_at - datetime.utcnow()
+    if remaining.total_seconds() <= 0:
+        return "❌ Ye link expire ho chuka hai."
+    hours, rem = divmod(int(remaining.total_seconds()), 3600)
+    days, hours = divmod(hours, 24)
+    minutes = rem // 60
+    if days:
+        left = f"{days}d {hours}h"
+    elif hours:
+        left = f"{hours}h {minutes}m"
+    else:
+        left = f"{minutes}m"
+    return f"⏳ Expires in {left} (UTC {expires_at.strftime('%d-%m-%Y %H:%M')})."
+
+
+async def _deliver_audio_batch(update, context, key, entry):
+    """Sends every file in a batch, then schedules deletion of each message."""
+    files = entry.get("files") or []
+    await update.message.reply_text(f"🎧 Sending {len(files)} audio(s)...")
+
+    async def delayed_delete(message, delay):
+        await asyncio.sleep(delay)
+        try:
+            await message.delete()
+        except Exception:
+            pass  # already deleted / older than 48h / etc.
+
+    for audio_info in files:
+        try:
+            msg = await update.message.reply_audio(
+                audio=audio_info["file_id"],
+                caption=audio_info.get("title")
+            )
+            if Config.AUDIO_AUTODELETE_SECONDS:
+                # Fire-and-forget: a restart drops these tasks, so the
+                # message just stays in the chat. Acceptable — the link
+                # itself still expires server-side via the TTL index.
+                context.application.create_task(
+                    delayed_delete(msg, Config.AUDIO_AUTODELETE_SECONDS)
+                )
+            await asyncio.sleep(0.5)  # gap so Telegram doesn't rate-limit the burst
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Failed to send: {e}")
+
+
+async def handle_audio_deep_link(update, context, key):
+    """/start <key> — open to any (non-banned, channel-joined) user."""
+    entry = db.get_audio_batch(key)
+
+    if entry is None:
+        await update.message.reply_text("❌ Invalid or expired link.")
+        return True
+
+    if entry.get("status") != "ready":
+        # Draft batch: owner never pressed Done, so the link isn't live yet.
+        await update.message.reply_text("❌ Invalid or expired link.")
+        return True
+
+    await _deliver_audio_batch(update, context, key, entry)
+    return True
+
+
+async def audio_finalize(update, context, text):
+    """Turns the draft batch into a live link using a typed duration."""
+    key = context.user_data.get("audio_key")
+    batch = db.get_audio_batch(key) if key else None
+    if not batch:
+        context.user_data.pop("audio_key", None)
+        context.user_data["state"] = None
+        await update.message.reply_text(
+            "❌ Session expire ho gaya, phir se audio bhejein.",
+            reply_markup=get_audio_menu_keyboard()
+        )
+        return
+
+    if text in Config.AUDIO_EXPIRY_OPTIONS:
+        seconds = Config.AUDIO_EXPIRY_OPTIONS[text]
+    else:
+        try:
+            seconds = parse_audio_duration(text)
+        except ValueError:
+            await update.message.reply_text(
+                "❓ Samajh nahi aaya. Button choose karein, ya "
+                "`45m` / `2h30m` / `3d` / `never` jaisa likhein.",
+                reply_markup=get_audio_expiry_keyboard(),
+                parse_mode="Markdown"
+            )
+            return  # stay in AUDIO_EXPIRY, let the owner retry
+
+    await _audio_publish(update, context, key, seconds)
+
+
+async def _audio_publish(update, context, key, seconds):
+    expires_at = (datetime.utcnow() + timedelta(seconds=seconds)) if seconds is not None else None
+    db.finalize_audio_batch(key, expires_at)
+    batch = db.get_audio_batch(key)
+
+    context.user_data.pop("audio_key", None)
+    context.user_data["state"] = None
+
+    me = await context.bot.get_me()
+    link = f"https://t.me/{me.username}?start={key}"
+    count = len(batch.get("files", [])) if batch else 0
+
+    message = (
+        f"🔗 **Share this link:**\n`{link}`\n\n"
+        f"🎵 {count} file(s)\n{_format_expiry(expires_at)}"
+    )
+    target = update.callback_query.message if update.callback_query else update.message
+    await target.reply_text(message, reply_markup=get_audio_menu_keyboard(), parse_mode="Markdown")
+
 
 # ========== COPYRIGHT PROTECTION SYSTEM — HELPERS ==========
 
@@ -249,6 +444,15 @@ async def start(update, context):
         user.id
     ):
         return
+
+    # Audio Vault deep link: /start <key>. Deliberately NOT owner-gated —
+    # only creating links is owner-only, redeeming them is public. Note the
+    # force-join check above still runs first, so shared links keep feeding
+    # the required-channel funnel.
+    args = context.args or []
+    if args:
+        if await handle_audio_deep_link(update, context, args[0]):
+            return
 
     welcome_text = (
         f"**Welcome {user.first_name}!**\n\n"
@@ -643,6 +847,144 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
         context.user_data["state"] = SET_DEFAULT_AI_LIMIT
 
+
+    # ===== AUDIO VAULT (owner only) =====
+    elif data == "audio_menu":
+        if not is_owner(user_id):
+            await query.answer("Sirf owner access kar sakta hai!", show_alert=True)
+            return
+        draft = db.get_draft_audio_batch(user_id)
+        note = ""
+        if draft and draft.get("files"):
+            # Draft survived a restart — tell the owner instead of silently
+            # starting a second batch and orphaning the first.
+            note = f"\n\n⚠️ Ek adhoora batch pada hai ({len(draft['files'])} file). Upload par resume hoga."
+        await query.edit_message_text(
+            "🎵 **Audio Vault**\n\nOwner-only shareable audio links." + note,
+            reply_markup=get_audio_menu_keyboard(),
+            parse_mode="Markdown"
+        )
+
+    elif data == "audio_upload":
+        if not is_owner(user_id):
+            return
+        draft = db.get_draft_audio_batch(user_id)
+        if not draft:
+            key = _new_audio_key()
+            db.create_audio_batch(
+                key, user_id,
+                datetime.utcnow() + timedelta(seconds=Config.AUDIO_DRAFT_TTL_SECONDS)
+            )
+            count = 0
+        else:
+            key = draft["key"]
+            count = len(draft.get("files", []))
+        context.user_data["audio_key"] = key
+        context.user_data["state"] = AUDIO_UPLOAD
+        await query.edit_message_text(
+            "🎤 **Audio bhejein** (audio / voice / audio document).\n\n"
+            "Jitne chahein bhej sakte hain. Sab ek hi link mein jayenge.\n"
+            f"Abhi is batch mein: **{count}** file(s).",
+            reply_markup=get_audio_upload_keyboard(count),
+            parse_mode="Markdown"
+        )
+
+    elif data == "audio_done":
+        if not is_owner(user_id):
+            return
+        key = context.user_data.get("audio_key")
+        batch = db.get_audio_batch(key) if key else None
+        if not batch or not batch.get("files"):
+            await query.edit_message_text(
+                "❌ Abhi tak koi audio save nahi hui.",
+                reply_markup=get_audio_menu_keyboard()
+            )
+            return
+        context.user_data["state"] = AUDIO_EXPIRY
+        await query.edit_message_text(
+            "⏳ **Ye link kitni der valid rahe?**\n\n"
+            "Neeche se choose karein, ya khud type karein "
+            "(jaise `45m`, `2h30m`, `3d`, `never`).",
+            reply_markup=get_audio_expiry_keyboard(),
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("audio_exp_"):
+        if not is_owner(user_id):
+            return
+        key = context.user_data.get("audio_key")
+        if not key or not db.get_audio_batch(key):
+            context.user_data["state"] = None
+            await query.edit_message_text(
+                "❌ Session expire ho gaya, phir se audio bhejein.",
+                reply_markup=get_audio_menu_keyboard()
+            )
+            return
+        try:
+            idx = int(data.replace("audio_exp_", ""))
+            label = list(Config.AUDIO_EXPIRY_OPTIONS.keys())[idx]
+        except (ValueError, IndexError):
+            return
+        await _audio_publish(update, context, key, Config.AUDIO_EXPIRY_OPTIONS[label])
+
+    elif data == "audio_cancel":
+        if not is_owner(user_id):
+            return
+        key = context.user_data.pop("audio_key", None)
+        if key:
+            db.delete_audio_batch(key)
+        context.user_data["state"] = None
+        await query.edit_message_text(
+            "🗑️ Batch cancel ho gaya.",
+            reply_markup=get_audio_menu_keyboard()
+        )
+
+    elif data == "audio_list":
+        if not is_owner(user_id):
+            return
+        batches = db.list_audio_batches(user_id)
+        if not batches:
+            await query.edit_message_text(
+                "📂 Koi active link nahi hai.",
+                reply_markup=get_audio_menu_keyboard()
+            )
+        else:
+            await query.edit_message_text(
+                "📂 **Active Links:**",
+                reply_markup=get_audio_list_keyboard(batches),
+                parse_mode="Markdown"
+            )
+
+    elif data.startswith("audio_detail_"):
+        if not is_owner(user_id):
+            return
+        key = data.replace("audio_detail_", "")
+        batch = db.get_audio_batch(key)
+        if not batch:
+            await query.edit_message_text(
+                "❌ Ye link ab exist nahi karta (expire ya delete ho chuka).",
+                reply_markup=get_audio_menu_keyboard()
+            )
+            return
+        me = await context.bot.get_me()
+        titles = "\n".join(f"• {f.get('title')}" for f in batch.get("files", [])[:10])
+        await query.edit_message_text(
+            f"🔗 `https://t.me/{me.username}?start={key}`\n\n"
+            f"{_format_expiry(batch.get('expires_at'))}\n\n"
+            f"🎵 **{len(batch.get('files', []))} file(s):**\n{titles}",
+            reply_markup=get_audio_detail_keyboard(key),
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("audio_del_"):
+        if not is_owner(user_id):
+            return
+        key = data.replace("audio_del_", "")
+        db.delete_audio_batch(key)
+        await query.edit_message_text(
+            "🗑️ Link delete ho gaya. Ab ye kaam nahi karega.",
+            reply_markup=get_audio_menu_keyboard()
+        )
 
     elif data == "channel_list":
         if not is_owner(user_id):
@@ -1134,6 +1476,51 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text  # None for media messages — checked below per-type
     state = context.user_data.get("state")
 
+    # ----- Audio Vault upload (owner only) -----
+    # Checked before the SCHEDULE_MEDIA branches because audio/voice/document
+    # are handled there too; whichever state is active wins, and the two
+    # states are mutually exclusive.
+    if state == AUDIO_UPLOAD:
+        if not is_owner(user.id):
+            context.user_data["state"] = None
+            return
+        audio = _extract_audio(update.message)
+        if not audio:
+            await update.message.reply_text("❌ Valid audio file bhejein.")
+            return
+        key = context.user_data.get("audio_key")
+        batch = db.get_audio_batch(key) if key else None
+        if not batch:
+            context.user_data["state"] = None
+            context.user_data.pop("audio_key", None)
+            await update.message.reply_text(
+                "❌ Batch nahi mila, Audio Vault se dobara shuru karein.",
+                reply_markup=get_audio_menu_keyboard()
+            )
+            return
+        title = getattr(audio, "file_name", None) or f"audio_{len(batch.get('files', [])) + 1}.mp3"
+        updated = db.append_audio_file(key, audio.file_id, title)
+        count = len(updated.get("files", [])) if updated else 0
+        await update.message.reply_text(
+            f"🎵 Saved: {title} ({count})",
+            reply_markup=get_audio_upload_keyboard(count)
+        )
+        return
+
+    if state == AUDIO_EXPIRY:
+        if not is_owner(user.id):
+            context.user_data["state"] = None
+            return
+        if not text:
+            await update.message.reply_text(
+                "❌ Duration text bhejein (jaise `2h30m`) ya button dabayein.",
+                reply_markup=get_audio_expiry_keyboard(),
+                parse_mode="Markdown"
+            )
+            return
+        await audio_finalize(update, context, text)
+        return
+
     # Handle media messages (photo, video, document, etc.)
     if update.message.photo and state == SCHEDULE_MEDIA:
         file_id = update.message.photo[-1].file_id
@@ -1208,9 +1595,21 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state == AI_CHAT:
+        allowed, limit_msg = check_ai_limit(user.id)
+        if not allowed:
+            await update.message.reply_text(limit_msg, parse_mode="Markdown")
+            return
+
         await update.message.reply_text("**Soche raha hoon...**", parse_mode="Markdown")
         response, msg = await api_client.ai_chat(user.id, text)
         if response:
+            db.log_ai_request(user.id, text, response)
+            if not is_owner(user.id):
+                db.update_user_ai_usage(user.id)
+                updated_user = db.get_user(user.id)
+                ai_limit = updated_user.get("ai_limit") or Config.DEFAULT_AI_LIMIT
+                remaining = max(ai_limit - updated_user.get("ai_requests_today", 0), 0)
+                msg = f"✅ Aapke paas {remaining} requests baki hain aaj ke liye."
             await update.message.reply_text(f"**AI Response:**\n\n{response}\n\n{msg}", parse_mode="Markdown")
         else:
             await update.message.reply_text(msg, parse_mode="Markdown")
