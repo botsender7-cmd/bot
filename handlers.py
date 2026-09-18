@@ -888,6 +888,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_audio_upload_keyboard(count),
             parse_mode="Markdown"
         )
+        # Track this message so subsequent uploads EDIT it instead of
+        # sending a new "saved" bubble per file.
+        context.user_data["audio_status_chat_id"] = query.message.chat_id
+        context.user_data["audio_status_msg_id"] = query.message.message_id
 
     elif data == "audio_done":
         if not is_owner(user_id):
@@ -901,6 +905,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         context.user_data["state"] = AUDIO_EXPIRY
+        context.user_data.pop("audio_status_chat_id", None)
+        context.user_data.pop("audio_status_msg_id", None)
         await query.edit_message_text(
             "⏳ **Ye link kitni der valid rahe?**\n\n"
             "Neeche se choose karein, ya khud type karein "
@@ -934,6 +940,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key:
             db.delete_audio_batch(key)
         context.user_data["state"] = None
+        context.user_data.pop("audio_status_chat_id", None)
+        context.user_data.pop("audio_status_msg_id", None)
         await query.edit_message_text(
             "🗑️ Batch cancel ho gaya.",
             reply_markup=get_audio_menu_keyboard()
@@ -1501,10 +1509,44 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = getattr(audio, "file_name", None) or f"audio_{len(batch.get('files', [])) + 1}.mp3"
         updated = db.append_audio_file(key, audio.file_id, title)
         count = len(updated.get("files", [])) if updated else 0
-        await update.message.reply_text(
-            f"🎵 Saved: {title} ({count})",
-            reply_markup=get_audio_upload_keyboard(count)
+
+        # Delete the owner's audio message so the chat doesn't fill up with
+        # one bubble per file — the status message below is the only thing
+        # that should visibly update.
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        status_text = (
+            "🎤 **Audio bhejein** (audio / voice / audio document).\n\n"
+            "Jitne chahein bhej sakte hain. Sab ek hi link mein jayenge.\n"
+            f"Abhi is batch mein: **{count}** file(s).\n\n"
+            f"🎵 Last saved: {title}"
         )
+        chat_id = context.user_data.get("audio_status_chat_id")
+        msg_id = context.user_data.get("audio_status_msg_id")
+        edited = False
+        if chat_id and msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=status_text,
+                    reply_markup=get_audio_upload_keyboard(count),
+                    parse_mode="Markdown"
+                )
+                edited = True
+            except Exception:
+                pass  # status message too old/deleted — fall back below
+        if not edited:
+            sent = await update.message.reply_text(
+                status_text,
+                reply_markup=get_audio_upload_keyboard(count),
+                parse_mode="Markdown"
+            )
+            context.user_data["audio_status_chat_id"] = sent.chat_id
+            context.user_data["audio_status_msg_id"] = sent.message_id
         return
 
     if state == AUDIO_EXPIRY:
