@@ -548,7 +548,7 @@ class Database:
         return self._clean_many(self.audit_log.find({"target_user_id": user_id}).sort("created_at", DESCENDING))
 
     # ========== LEAVE-BAN GUARD ==========
-    def set_leaveban(self, chat_id, enabled, user, contact_username=None):
+    def set_leaveban(self, chat_id, enabled, user, contact_username=None, title=None):
         """`user` = who ran /leaveban. `contact_username` = the @username (no @)
         the setter typed when asked; shown in the join warning."""
         fields = {"enabled": bool(enabled), "updated_by": user.id,
@@ -557,6 +557,8 @@ class Database:
             fields["enabled_by"] = user.id
             if contact_username:
                 fields["contact_username"] = contact_username
+            if title:
+                fields["title"] = title
         self.leaveban_groups.update_one({"chat_id": chat_id}, {"$set": fields}, upsert=True)
 
     def set_leaveban_contact(self, chat_id, contact_username, user):
@@ -566,6 +568,11 @@ class Database:
                       "updated_at": datetime.utcnow()}},
             upsert=True,
         )
+
+    def list_leaveban_groups(self, enabled_by=None, limit=30):
+        """Groups set up through the bot. enabled_by=None -> all (bot owner/admins)."""
+        q = {"enabled_by": enabled_by} if enabled_by else {"enabled_by": {"$exists": True}}
+        return list(self.leaveban_groups.find(q, {"_id": 0}).sort("updated_at", DESCENDING).limit(limit))
 
     def get_leaveban(self, chat_id):
         return self.leaveban_groups.find_one({"chat_id": chat_id}, {"_id": 0})

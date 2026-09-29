@@ -240,7 +240,7 @@ async def _ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE, mode:
 async def _save_contact(update, context, mode: str, username: str):
     chat, caller = update.effective_chat, update.effective_user
     if mode == "on":
-        db.set_leaveban(chat.id, True, caller, username)
+        db.set_leaveban(chat.id, True, caller, username, chat.title)
         await update.message.reply_text(
             f"✅ Leave-ban ON. Ab jo khud leave karega wo ban hoga.\n"
             f"Warning me contact: @{username}\n"
@@ -330,3 +330,124 @@ async def leaveban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Leave-ban: {state}\nContact: {who}\n\n"
             "Use: /leaveban on | off | contact [@username]"
         )
+
+
+# ------------------------------------------------------------ main-menu (private chat)
+# Reached from handlers.callback_handler (so the bot's ban / force-join checks
+# still apply). Callback data: leaveban_menu, lb_list, lb_help, lb_g:<chat>, lb_t:<chat>.
+def _menu_text() -> str:
+    return (
+        "🚪 <b>Leave-Ban Guard</b>\n\n"
+        "Group se jo <b>khud leave</b> karega wo automatically ban ho jayega. "
+        "Join par warning milti hai, aur galti se leave karne wala aapke diye "
+        "@username se contact karke unban ho sakta hai.\n\n"
+        "Setup group ke andar hota hai: <code>/leaveban on</code>"
+    )
+
+
+def _menu_kb(bot_username: str) -> InlineKeyboardMarkup:
+    add_url = f"https://t.me/{bot_username}?startgroup=true&admin=restrict_members"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Bot ko group me add karo", url=add_url)],
+        [InlineKeyboardButton("📋 Mere Groups", callback_data="lb_list"),
+         InlineKeyboardButton("ℹ️ Kaise use karein", callback_data="lb_help")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
+    ])
+
+
+def _back_kb(target="leaveban_menu") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=target)]])
+
+
+async def _show(query, text, kb):
+    try:
+        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception as e:  # "message is not modified" etc.
+        logger.debug(f"leaveban menu edit skipped: {e}")
+
+
+async def _group_detail(query, context, chat_id: int, note: str = ""):
+    cfg = db.get_leaveban(chat_id)
+    if not cfg:
+        await _show(query, "❌ Group nahi mila.", _back_kb("lb_list"))
+        return
+    on = bool(cfg.get("enabled"))
+    contact = f"@{cfg['contact_username']}" if cfg.get("contact_username") else "set nahi hai"
+    text = (
+        f"🚪 <b>{html.escape(cfg.get('title') or str(chat_id))}</b>\n\n"
+        f"Status: {'ON ✅' if on else 'OFF ❌'}\n"
+        f"Warning contact: {html.escape(contact)}\n\n"
+        "Contact badalne ke liye group me: <code>/leaveban contact @username</code>"
+        + (f"\n\n{note}" if note else "")
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔴 OFF karo" if on else "🟢 ON karo", callback_data=f"lb_t:{chat_id}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="lb_list")],
+    ])
+    await _show(query, text, kb)
+
+
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    query, user = update.callback_query, update.callback_query.from_user
+
+    if data == "leaveban_menu":
+        await _show(query, _menu_text(), _menu_kb(context.bot.username))
+
+    elif data == "lb_help":
+        await _show(query, (
+            "ℹ️ <b>Kaise use karein</b>\n\n"
+            "1️⃣ <b>➕ Bot ko group me add karo</b> dabao aur bot ko admin banao "
+            "(<b>Ban users</b> permission ke saath).\n"
+            "2️⃣ Group me <code>/leaveban on</code> likho.\n"
+            "3️⃣ Bot poochega kaunsa @username warning me dikhana hai. Us message ko "
+            "<b>reply</b> karke username bhejo (ya <code>me</code> likho).\n"
+            "4️⃣ Bas! Ab jo khud leave karega wo ban hoga, aur aapko yahan alert aayega "
+            "(is bot ko ek baar /start kiya hona chahiye).\n\n"
+            "Unban: alert ke <b>Unban</b> button se, ya group me <code>/unban user_id</code>.\n"
+            "Band karna: <code>/leaveban off</code> (ya <b>Mere Groups</b> se)."
+        ), _back_kb())
+
+    elif data == "lb_list":
+        groups = db.list_leaveban_groups(None if is_admin(user.id) else user.id)
+        if not groups:
+            await _show(query,
+                "📋 <b>Mere Groups</b>\n\nAbhi koi group nahi hai. Kisi group me "
+                "<code>/leaveban on</code> chalao, wo yahan dikhega.", _back_kb())
+            return
+        rows = [[InlineKeyboardButton(
+            f"{'✅' if g.get('enabled') else '❌'} {(g.get('title') or str(g['chat_id']))[:32]}",
+            callback_data=f"lb_g:{g['chat_id']}")] for g in groups]
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="leaveban_menu")])
+        await _show(query, "📋 <b>Mere Groups</b>\n\nGroup chuno:", InlineKeyboardMarkup(rows))
+
+    elif data.startswith(("lb_g:", "lb_t:")):
+        try:
+            chat_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        if not await _can_manage(user.id, chat_id, context.bot):
+            await _show(query, "❌ Aap is group ke admin nahi ho.", _back_kb("lb_list"))
+            return
+
+        if data.startswith("lb_t:"):
+            cfg = db.get_leaveban(chat_id) or {}
+            note = ""
+            if cfg.get("enabled"):
+                db.set_leaveban(chat_id, False, user)
+                note = "✅ Leave-ban OFF ho gaya."
+            elif not cfg.get("contact_username"):
+                note = "⚠️ Pehle group me <code>/leaveban on</code> chalao (username set karna padega)."
+            else:
+                try:
+                    me = await context.bot.get_chat_member(chat_id, context.bot.id)
+                    can_ban = me.status == ChatMemberStatus.OWNER or getattr(me, "can_restrict_members", False)
+                except Exception:
+                    can_ban = False
+                if not can_ban:
+                    note = "⚠️ Bot ko us group me admin banao (<b>Ban users</b> permission)."
+                else:
+                    db.set_leaveban(chat_id, True, user, cfg["contact_username"], cfg.get("title"))
+                    note = "✅ Leave-ban ON ho gaya."
+            await _group_detail(query, context, chat_id, note)
+        else:
+            await _group_detail(query, context, chat_id)

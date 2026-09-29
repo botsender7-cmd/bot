@@ -848,6 +848,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"] = SET_DEFAULT_AI_LIMIT
 
 
+    # ===== LEAVE-BAN GUARD MENU =====
+    elif data == "leaveban_menu" or data.startswith("lb_"):
+        from group_guard import handle_menu  # lazy: group_guard imports this module
+        await handle_menu(update, context, data)
+
     # ===== AUDIO VAULT (owner only) =====
     elif data == "audio_menu":
         if not is_owner(user_id):

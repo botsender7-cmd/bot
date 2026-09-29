@@ -56,3 +56,5 @@ Opt-in per group. Bot must be a group admin with **Ban users**.
   (they must have started the bot once). `/unban <user_id>` also works in the group.
 - Admin kicks are ignored; owner/bot-admins are exempt; channels are never touched.
 - Needs `chat_member` updates: already covered by `allowed_updates=Update.ALL_TYPES` in `bot.py`.
+- Main menu / side menu button **🚪 Leave-Ban Guard**: setup help, "Add bot to group" link, and **Mere Groups**
+  (per-group status, contact, ON/OFF; bot owner/admins see all groups).

@@ -16,6 +16,8 @@ def get_main_menu(user_id):
         InlineKeyboardButton("📨 My Scheduled", callback_data="my_scheduled")
     ])
 
+    buttons.append([InlineKeyboardButton("🚪 Leave-Ban Guard", callback_data="leaveban_menu")])
+
     is_admin = user_id in [a["user_id"] for a in __import__('database').db.get_all_admins()]
     is_owner = user_id == Config.OWNER_ID
 
@@ -204,6 +206,7 @@ def get_side_menu(user_id):
         [InlineKeyboardButton("📊 QR Code", callback_data="qr_code")],
         [InlineKeyboardButton("📢 Bot Updates", callback_data="bot_updates")],
         [InlineKeyboardButton("📨 My Scheduled", callback_data="my_scheduled")],
+        [InlineKeyboardButton("🚪 Leave-Ban Guard", callback_data="leaveban_menu")],
         [InlineKeyboardButton("❓ Help", callback_data="help")],
         [InlineKeyboardButton("❌ Close", callback_data="close")]
     ]
