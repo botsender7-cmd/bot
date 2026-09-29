@@ -54,6 +54,32 @@ async def _can_manage(user_id: int, chat_id: int, bot) -> bool:
         return False
 
 
+ANON_ADMIN_ID = 1087968824  # Telegram's "GroupAnonymousBot" (admins posting anonymously)
+
+
+async def _caller_is_manager(update: Update, bot) -> bool:
+    """Bot owner/admin or group admin. Anonymous admins (message sent 'as the
+    group') are accepted: Telegram only allows that for admins of this chat."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if msg is not None and msg.sender_chat is not None and msg.sender_chat.id == chat.id:
+        return True
+    return await _can_manage(user.id, chat.id, bot)
+
+
+async def _bot_rights(bot, chat_id: int):
+    """(is_admin, can_ban) for the bot itself in this chat. Works even when the
+    bot is not an admin (looking up itself is always allowed)."""
+    try:
+        me = await bot.get_chat_member(chat_id, bot.id)
+    except Exception:
+        return False, False
+    if me.status == ChatMemberStatus.OWNER:
+        return True, True
+    if me.status == ChatMemberStatus.ADMINISTRATOR:
+        return True, bool(getattr(me, "can_restrict_members", False))
+    return False, False
+
+
 def _parse_username(text: str):
     """'@name', 'name' or 't.me/name' -> 'name' (or None if invalid)."""
     t = re.sub(r"^(https?://)?(www\.)?t\.me/", "", (text or "").strip(), flags=re.I)
@@ -198,7 +224,8 @@ async def unban_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """In group: /unban <user_id>"""
     chat, caller = update.effective_chat, update.effective_user
-    if not await _can_manage(caller.id, chat.id, context.bot):
+    if not await _caller_is_manager(update, context.bot):
+        await update.message.reply_text("❌ Ye command sirf group ke admin/owner chala sakte hain.")
         return
     if not context.args or not context.args[0].lstrip("-").isdigit():
         await update.message.reply_text("Use: /unban <user_id>")
@@ -270,7 +297,8 @@ async def contact_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = msg.text.strip()
     if text.lower() in ("me", "main", "mera"):
-        username = user.username if user.username and _USERNAME_RE.match(user.username) else None
+        username = (user.username if user.id != ANON_ADMIN_ID and user.username
+                    and _USERNAME_RE.match(user.username) else None)
         if not username:
             await msg.reply_text("❌ Aapka public @username nahi hai. Koi aur username bhejo.")
             raise ApplicationHandlerStop
@@ -291,20 +319,27 @@ async def contact_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def leaveban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """In group: /leaveban on | off | status | contact [@username]"""
     chat, caller = update.effective_chat, update.effective_user
-    if not await _can_manage(caller.id, chat.id, context.bot):
-        return
     arg = (context.args[0].lower() if context.args else "status")
+    logger.info(f"/leaveban {arg} from {caller.id} in {chat.id}")
+
+    # 1) Bot itself must be an admin, otherwise nothing here can work.
+    bot_admin, can_ban = await _bot_rights(context.bot, chat.id)
+    if not bot_admin:
+        await update.message.reply_text(
+            "❌ Pehle mujhe is group me <b>admin</b> banao (<b>Ban users</b> permission ke saath), "
+            "phir /leaveban on karo.", parse_mode=ParseMode.HTML)
+        return
+
+    # 2) Caller must be an admin (anonymous admins included).
+    if not await _caller_is_manager(update, context.bot):
+        await update.message.reply_text("❌ Ye command sirf group ke admin/owner chala sakte hain.")
+        return
 
     if arg == "on":
-        try:
-            me = await context.bot.get_chat_member(chat.id, context.bot.id)
-            can_ban = me.status == ChatMemberStatus.OWNER or getattr(me, "can_restrict_members", False)
-        except Exception:
-            can_ban = False
         if not can_ban:
             await update.message.reply_text(
-                "❌ Pehle bot ko is group me admin banao aur 'Ban users' permission do, phir /leaveban on karo."
-            )
+                "❌ Mere paas <b>Ban users</b> permission nahi hai. Group ki admin settings me "
+                "mujhe ye permission do, phir /leaveban on karo.", parse_mode=ParseMode.HTML)
             return
         await _ask_contact(update, context, "on")
 
@@ -330,124 +365,3 @@ async def leaveban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Leave-ban: {state}\nContact: {who}\n\n"
             "Use: /leaveban on | off | contact [@username]"
         )
-
-
-# ------------------------------------------------------------ main-menu (private chat)
-# Reached from handlers.callback_handler (so the bot's ban / force-join checks
-# still apply). Callback data: leaveban_menu, lb_list, lb_help, lb_g:<chat>, lb_t:<chat>.
-def _menu_text() -> str:
-    return (
-        "🚪 <b>Leave-Ban Guard</b>\n\n"
-        "Group se jo <b>khud leave</b> karega wo automatically ban ho jayega. "
-        "Join par warning milti hai, aur galti se leave karne wala aapke diye "
-        "@username se contact karke unban ho sakta hai.\n\n"
-        "Setup group ke andar hota hai: <code>/leaveban on</code>"
-    )
-
-
-def _menu_kb(bot_username: str) -> InlineKeyboardMarkup:
-    add_url = f"https://t.me/{bot_username}?startgroup=true&admin=restrict_members"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Bot ko group me add karo", url=add_url)],
-        [InlineKeyboardButton("📋 Mere Groups", callback_data="lb_list"),
-         InlineKeyboardButton("ℹ️ Kaise use karein", callback_data="lb_help")],
-        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
-    ])
-
-
-def _back_kb(target="leaveban_menu") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=target)]])
-
-
-async def _show(query, text, kb):
-    try:
-        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    except Exception as e:  # "message is not modified" etc.
-        logger.debug(f"leaveban menu edit skipped: {e}")
-
-
-async def _group_detail(query, context, chat_id: int, note: str = ""):
-    cfg = db.get_leaveban(chat_id)
-    if not cfg:
-        await _show(query, "❌ Group nahi mila.", _back_kb("lb_list"))
-        return
-    on = bool(cfg.get("enabled"))
-    contact = f"@{cfg['contact_username']}" if cfg.get("contact_username") else "set nahi hai"
-    text = (
-        f"🚪 <b>{html.escape(cfg.get('title') or str(chat_id))}</b>\n\n"
-        f"Status: {'ON ✅' if on else 'OFF ❌'}\n"
-        f"Warning contact: {html.escape(contact)}\n\n"
-        "Contact badalne ke liye group me: <code>/leaveban contact @username</code>"
-        + (f"\n\n{note}" if note else "")
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔴 OFF karo" if on else "🟢 ON karo", callback_data=f"lb_t:{chat_id}")],
-        [InlineKeyboardButton("🔙 Back", callback_data="lb_list")],
-    ])
-    await _show(query, text, kb)
-
-
-async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    query, user = update.callback_query, update.callback_query.from_user
-
-    if data == "leaveban_menu":
-        await _show(query, _menu_text(), _menu_kb(context.bot.username))
-
-    elif data == "lb_help":
-        await _show(query, (
-            "ℹ️ <b>Kaise use karein</b>\n\n"
-            "1️⃣ <b>➕ Bot ko group me add karo</b> dabao aur bot ko admin banao "
-            "(<b>Ban users</b> permission ke saath).\n"
-            "2️⃣ Group me <code>/leaveban on</code> likho.\n"
-            "3️⃣ Bot poochega kaunsa @username warning me dikhana hai. Us message ko "
-            "<b>reply</b> karke username bhejo (ya <code>me</code> likho).\n"
-            "4️⃣ Bas! Ab jo khud leave karega wo ban hoga, aur aapko yahan alert aayega "
-            "(is bot ko ek baar /start kiya hona chahiye).\n\n"
-            "Unban: alert ke <b>Unban</b> button se, ya group me <code>/unban user_id</code>.\n"
-            "Band karna: <code>/leaveban off</code> (ya <b>Mere Groups</b> se)."
-        ), _back_kb())
-
-    elif data == "lb_list":
-        groups = db.list_leaveban_groups(None if is_admin(user.id) else user.id)
-        if not groups:
-            await _show(query,
-                "📋 <b>Mere Groups</b>\n\nAbhi koi group nahi hai. Kisi group me "
-                "<code>/leaveban on</code> chalao, wo yahan dikhega.", _back_kb())
-            return
-        rows = [[InlineKeyboardButton(
-            f"{'✅' if g.get('enabled') else '❌'} {(g.get('title') or str(g['chat_id']))[:32]}",
-            callback_data=f"lb_g:{g['chat_id']}")] for g in groups]
-        rows.append([InlineKeyboardButton("🔙 Back", callback_data="leaveban_menu")])
-        await _show(query, "📋 <b>Mere Groups</b>\n\nGroup chuno:", InlineKeyboardMarkup(rows))
-
-    elif data.startswith(("lb_g:", "lb_t:")):
-        try:
-            chat_id = int(data.split(":", 1)[1])
-        except ValueError:
-            return
-        if not await _can_manage(user.id, chat_id, context.bot):
-            await _show(query, "❌ Aap is group ke admin nahi ho.", _back_kb("lb_list"))
-            return
-
-        if data.startswith("lb_t:"):
-            cfg = db.get_leaveban(chat_id) or {}
-            note = ""
-            if cfg.get("enabled"):
-                db.set_leaveban(chat_id, False, user)
-                note = "✅ Leave-ban OFF ho gaya."
-            elif not cfg.get("contact_username"):
-                note = "⚠️ Pehle group me <code>/leaveban on</code> chalao (username set karna padega)."
-            else:
-                try:
-                    me = await context.bot.get_chat_member(chat_id, context.bot.id)
-                    can_ban = me.status == ChatMemberStatus.OWNER or getattr(me, "can_restrict_members", False)
-                except Exception:
-                    can_ban = False
-                if not can_ban:
-                    note = "⚠️ Bot ko us group me admin banao (<b>Ban users</b> permission)."
-                else:
-                    db.set_leaveban(chat_id, True, user, cfg["contact_username"], cfg.get("title"))
-                    note = "✅ Leave-ban ON ho gaya."
-            await _group_detail(query, context, chat_id, note)
-        else:
-            await _group_detail(query, context, chat_id)
