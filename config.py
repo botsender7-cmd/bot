@@ -78,3 +78,12 @@ class Config:
     # change this per-user — it's a flat constant. If you need per-user
     # configurability later, that's a separate feature (DB field + command).
     STRIKE_RESTRICTION_DAYS = 7
+
+    # ===== Leave-Ban Guard (groups only) =====
+    # Per-group opt-in: owner/admin runs /leaveban on inside the group.
+    TABLE_LEAVEBAN_GROUPS = "leaveban_groups"
+    # Public @username shown in the join warning so a wrongly-banned user
+    # knows who to contact. Optional; falls back to a generic line.
+    OWNER_USERNAME = os.getenv("OWNER_USERNAME", "").lstrip("@")
+    # Join-warning message is auto-deleted after this many seconds (0 = keep).
+    LEAVEBAN_WARN_DELETE_SECONDS = 60
