@@ -49,8 +49,9 @@ polling automatically, no webhook registration needed for local dev.
 
 ## Leave-Ban Guard (groups only)
 Opt-in per group. Bot must be a group admin with **Ban users**.
-- `/leaveban on|off|status` (group, owner/bot-admin/group-admin)
-- Join -> warning (auto-deleted after `LEAVEBAN_WARN_DELETE_SECONDS`).
+- `/leaveban on|off|status|contact [@username]` (group; owner/bot-admin/group-admin). `on` asks the setter
+  which @username to show in the warning (they reply to the bot's prompt); it turns on only after that.
+- Join -> warning (auto-deleted after `LEAVEBAN_WARN_DELETE_SECONDS`) showing that clickable @username (env `OWNER_USERNAME`/`LEAVEBAN_CONTACTS` = fallback only).
 - Leave by the user themselves -> banned; owner + bot admins get a DM with an **Unban** button
   (they must have started the bot once). `/unban <user_id>` also works in the group.
 - Admin kicks are ignored; owner/bot-admins are exempt; channels are never touched.

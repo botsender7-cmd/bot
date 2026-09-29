@@ -12,7 +12,8 @@ from handlers import (start, side_menu, help_command, callback_handler, message_
 chat_join_request, menu_command, handle_join_request, join_request, skip_command,
 combined_join_request_handler, report_command)
 from scheduler import init_scheduler, reschedule_pending_messages
-from group_guard import on_member_update, unban_button, unban_command, leaveban_command, CB_PREFIX
+from group_guard import (on_member_update, unban_button, unban_command,
+                         leaveban_command, contact_reply, CB_PREFIX)
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 logging.basicConfig(
@@ -37,7 +38,7 @@ async def post_init(application):
     # only to admins inside groups; private-chat menu above is untouched).
     await application.bot.set_my_commands(
         [
-            BotCommand("leaveban", "Leave-ban on/off/status"),
+            BotCommand("leaveban", "Leave-ban: on/off/status/contact"),
             BotCommand("unban", "Unban a user: /unban <user_id>"),
         ],
         scope=BotCommandScopeAllChatAdministrators(),
@@ -109,6 +110,12 @@ def main():
     # raises ApplicationHandlerStop so callback_handler never sees these.
     application.add_handler(
         CallbackQueryHandler(unban_button, pattern=f"^{CB_PREFIX}"), group=-1
+    )
+    # Catches the setter's reply to the "which @username?" prompt (group -1, falls
+    # through untouched when no prompt is pending, so other handlers are unaffected).
+    application.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, contact_reply),
+        group=-1,
     )
     application.add_handler(ChatMemberHandler(on_member_update, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(CommandHandler("leaveban", leaveban_command, filters=filters.ChatType.GROUPS))

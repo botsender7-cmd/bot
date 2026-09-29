@@ -82,8 +82,8 @@ class Config:
     # ===== Leave-Ban Guard (groups only) =====
     # Per-group opt-in: owner/admin runs /leaveban on inside the group.
     TABLE_LEAVEBAN_GROUPS = "leaveban_groups"
-    # Public @username shown in the join warning so a wrongly-banned user
-    # knows who to contact. Optional; falls back to a generic line.
+    # FALLBACK only: the join warning normally shows the @username the setter typed
+    # when /leaveban on asked for it. Used just for groups enabled before that existed.
     OWNER_USERNAME = os.getenv("OWNER_USERNAME", "").lstrip("@")
     # Comma-separated usernames (no @) shown as clickable contacts in the join
     # warning, e.g. "owner_user,admin_user". Empty -> falls back to OWNER_USERNAME,
