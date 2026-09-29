@@ -31,6 +31,7 @@ class Database:
         self.audit_log = self.db["audit_log"]
         self.counters = self.db["counters"]
         self.audio_batches = self.db[Config.TABLE_AUDIO_BATCHES]
+        self.leaveban_groups = self.db[Config.TABLE_LEAVEBAN_GROUPS]
 
         # Fail fast if the connection string / cluster is unreachable, same
         # spirit as the old pool creation failing loudly on bad DSNs.
@@ -58,6 +59,9 @@ class Database:
 
         # ----- Audio Vault -----
         self.audio_batches.create_index("key", unique=True)
+
+        # ----- Leave-Ban Guard -----
+        self.leaveban_groups.create_index("chat_id", unique=True)
         self.audio_batches.create_index([("owner_id", ASCENDING), ("status", ASCENDING)])
         # TTL index: Mongo deletes the document once `expires_at` passes.
         # This is what replaces the old bot's CLEANUP_INTERVAL_SECONDS job.
@@ -542,6 +546,19 @@ class Database:
 
     def get_user_audit_log(self, user_id):
         return self._clean_many(self.audit_log.find({"target_user_id": user_id}).sort("created_at", DESCENDING))
+
+    # ========== LEAVE-BAN GUARD ==========
+    def set_leaveban(self, chat_id, enabled, updated_by):
+        self.leaveban_groups.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"enabled": bool(enabled), "updated_by": updated_by,
+                      "updated_at": datetime.utcnow()}},
+            upsert=True,
+        )
+
+    def is_leaveban_enabled(self, chat_id):
+        doc = self.leaveban_groups.find_one({"chat_id": chat_id}, {"enabled": 1})
+        return bool(doc and doc.get("enabled"))
 
 
 db = Database()

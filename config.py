@@ -85,5 +85,9 @@ class Config:
     # Public @username shown in the join warning so a wrongly-banned user
     # knows who to contact. Optional; falls back to a generic line.
     OWNER_USERNAME = os.getenv("OWNER_USERNAME", "").lstrip("@")
+    # Comma-separated usernames (no @) shown as clickable contacts in the join
+    # warning, e.g. "owner_user,admin_user". Empty -> falls back to OWNER_USERNAME,
+    # then to a clickable link on OWNER_ID.
+    LEAVEBAN_CONTACTS = [c.strip().lstrip("@") for c in os.getenv("LEAVEBAN_CONTACTS", "").split(",") if c.strip()]
     # Join-warning message is auto-deleted after this many seconds (0 = keep).
     LEAVEBAN_WARN_DELETE_SECONDS = 60

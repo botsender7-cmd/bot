@@ -1,13 +1,18 @@
+from dotenv import load_dotenv
+load_dotenv()  # must run before `config` is imported (Config reads env at import time)
+
 import logging
 import os
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ChatJoinRequestHandler, filters
+from telegram import Update, BotCommand, BotCommandScopeAllChatAdministrators
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+                          ChatJoinRequestHandler, ChatMemberHandler, filters)
 from telegram.request import HTTPXRequest
 from config import Config
 from handlers import (start, side_menu, help_command, callback_handler, message_handler,
 chat_join_request, menu_command, handle_join_request, join_request, skip_command,
 combined_join_request_handler, report_command)
 from scheduler import init_scheduler, reschedule_pending_messages
+from group_guard import on_member_update, unban_button, unban_command, leaveban_command, CB_PREFIX
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 logging.basicConfig(
@@ -27,6 +32,16 @@ async def post_init(application):
         BotCommand("menu", "Open Menu"),
         BotCommand("report", "Report Copyright Violation")
     ])
+
+    # Group-admin-only commands for the Leave-Ban Guard (shown in the "/" menu
+    # only to admins inside groups; private-chat menu above is untouched).
+    await application.bot.set_my_commands(
+        [
+            BotCommand("leaveban", "Leave-ban on/off/status"),
+            BotCommand("unban", "Unban a user: /unban <user_id>"),
+        ],
+        scope=BotCommandScopeAllChatAdministrators(),
+    )
 
     cmds = await application.bot.get_my_commands()
     logger.info(f"CURRENT COMMANDS: {cmds}")
@@ -88,6 +103,16 @@ def main():
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("skip", skip_command))
     application.add_handler(CommandHandler("report", report_command))
+
+    # ----- Leave-Ban Guard (groups only) -----
+    # group=-1 -> runs BEFORE the generic callback_handler below; unban_button
+    # raises ApplicationHandlerStop so callback_handler never sees these.
+    application.add_handler(
+        CallbackQueryHandler(unban_button, pattern=f"^{CB_PREFIX}"), group=-1
+    )
+    application.add_handler(ChatMemberHandler(on_member_update, ChatMemberHandler.CHAT_MEMBER))
+    application.add_handler(CommandHandler("leaveban", leaveban_command, filters=filters.ChatType.GROUPS))
+    application.add_handler(CommandHandler("unban", unban_command, filters=filters.ChatType.GROUPS))
 
     # Callback & Message Handlers
     application.add_handler(CallbackQueryHandler(callback_handler))

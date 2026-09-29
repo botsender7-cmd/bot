@@ -5,6 +5,7 @@ QR code generation are NOT implemented here — both are called over HTTP
 from the separately-deployed API service (`bot-api`, on Vercel).
 
 ## Env vars
+- `OWNER_USERNAME` (optional) — public @username shown in the leave-ban join warning
 - `BOT_TOKEN`, `OWNER_ID`, `MONGODB_URI`
 - `API_BASE_URL` — your Vercel API's URL, e.g. `https://<project>.vercel.app`
 - `API_KEY` — must exactly match `API_KEY` set on the Vercel `bot-api` project
@@ -45,3 +46,12 @@ python bot.py
 ```
 No `RENDER_EXTERNAL_URL`/`WEBHOOK_URL` set locally → falls back to
 polling automatically, no webhook registration needed for local dev.
+
+## Leave-Ban Guard (groups only)
+Opt-in per group. Bot must be a group admin with **Ban users**.
+- `/leaveban on|off|status` (group, owner/bot-admin/group-admin)
+- Join -> warning (auto-deleted after `LEAVEBAN_WARN_DELETE_SECONDS`).
+- Leave by the user themselves -> banned; owner + bot admins get a DM with an **Unban** button
+  (they must have started the bot once). `/unban <user_id>` also works in the group.
+- Admin kicks are ignored; owner/bot-admins are exempt; channels are never touched.
+- Needs `chat_member` updates: already covered by `allowed_updates=Update.ALL_TYPES` in `bot.py`.
