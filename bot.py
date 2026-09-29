@@ -13,7 +13,7 @@ chat_join_request, menu_command, handle_join_request, join_request, skip_command
 combined_join_request_handler, report_command)
 from scheduler import init_scheduler, reschedule_pending_messages
 from group_guard import (on_member_update, unban_button, unban_command,
-                         leaveban_command, contact_reply, CB_PREFIX)
+                         leaveban_command, contact_reply, private_help, CB_PREFIX)
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 logging.basicConfig(
@@ -120,6 +120,8 @@ def main():
     application.add_handler(ChatMemberHandler(on_member_update, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(CommandHandler("leaveban", leaveban_command, filters=filters.ChatType.GROUPS))
     application.add_handler(CommandHandler("unban", unban_command, filters=filters.ChatType.GROUPS))
+    # Typed in the bot's private chat -> show the guide instead of silence.
+    application.add_handler(CommandHandler(["leaveban", "unban"], private_help, filters=filters.ChatType.PRIVATE))
 
     # Callback & Message Handlers
     application.add_handler(CallbackQueryHandler(callback_handler))
