@@ -91,3 +91,17 @@ class Config:
     LEAVEBAN_CONTACTS = [c.strip().lstrip("@") for c in os.getenv("LEAVEBAN_CONTACTS", "").split(",") if c.strip()]
     # Join-warning message is auto-deleted after this many seconds (0 = keep).
     LEAVEBAN_WARN_DELETE_SECONDS = 60
+
+    # ===== Private Share (owner -> per-user private links) =====
+    # Owner uploads any media into a batch, then generates one link PER
+    # USER ID. A link only works for the Telegram account it was
+    # made for, and everything is sent with protect_content=True.
+    TABLE_PSHARE_BATCHES = "pshare_batches"
+    TABLE_PSHARE_LINKS = "pshare_links"
+    # Unfinished upload batches are purged after this long (TTL index).
+    PSHARE_DRAFT_TTL_SECONDS = 24 * 60 * 60
+    # Delete delivered files from the user's chat after N seconds.
+    # 0 = keep them (lectures usually need to stay watchable).
+    PSHARE_AUTODELETE_SECONDS = 0
+    # Random part of the link key (9 bytes ~ 72 bits).
+    PSHARE_KEY_BYTES = 9

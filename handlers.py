@@ -9,6 +9,7 @@ from database import db
 import api_client
 from keyboards import *
 from scheduler import scheduler
+import pshare
 from datetime import datetime, timedelta, timezone, date
 
 USER_CHANNEL_ADD = 999
@@ -451,6 +452,9 @@ async def start(update, context):
     # the required-channel funnel.
     args = context.args or []
     if args:
+        # Private Share links (pl_...) are bound to one user ID; checked first.
+        if await pshare.handle_pshare_deep_link(update, context, args[0]):
+            return
         if await handle_audio_deep_link(update, context, args[0]):
             return
 
@@ -852,6 +856,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "leaveban_menu" or data.startswith("lb_"):
         from group_guard import handle_menu  # lazy: group_guard imports this module
         await handle_menu(update, context, data)
+
+    # ===== PSHARE VAULT (owner only) =====
+    elif data.startswith(pshare.CB_PREFIX):
+        await pshare.handle_callback(update, context, data)
 
     # ===== AUDIO VAULT (owner only) =====
     elif data == "audio_menu":
@@ -1488,6 +1496,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text  # None for media messages — checked below per-type
     state = context.user_data.get("state")
+
+    # ----- Private Share (owner only): batch upload + user user IDs -----
+    if pshare.is_pshare_state(state):
+        if await pshare.handle_message(update, context, state):
+            return
 
     # ----- Audio Vault upload (owner only) -----
     # Checked before the SCHEDULE_MEDIA branches because audio/voice/document

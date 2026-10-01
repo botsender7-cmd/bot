@@ -32,6 +32,8 @@ class Database:
         self.counters = self.db["counters"]
         self.audio_batches = self.db[Config.TABLE_AUDIO_BATCHES]
         self.leaveban_groups = self.db[Config.TABLE_LEAVEBAN_GROUPS]
+        self.pshare_batches = self.db[Config.TABLE_PSHARE_BATCHES]
+        self.pshare_links = self.db[Config.TABLE_PSHARE_LINKS]
 
         # Fail fast if the connection string / cluster is unreachable, same
         # spirit as the old pool creation failing loudly on bad DSNs.
@@ -59,6 +61,19 @@ class Database:
 
         # ----- Audio Vault -----
         self.audio_batches.create_index("key", unique=True)
+
+        # ----- Private Share -----
+        self.pshare_batches.create_index("batch_id", unique=True)
+        self.pshare_batches.create_index([("owner_id", ASCENDING), ("status", ASCENDING)])
+        self.pshare_links.create_index("key", unique=True)
+        # One link per (batch, user): asking again returns the same link.
+        self.pshare_links.create_index([("batch_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+        try:
+            # Only drafts carry draft_expires_at (removed on finalize), so
+            # finished batches are never touched by this TTL.
+            self.pshare_batches.create_index("draft_expires_at", expireAfterSeconds=0)
+        except Exception as e:
+            print(f"[WARN] pshare_batches TTL index not created: {e}")
 
         # ----- Leave-Ban Guard -----
         self.leaveban_groups.create_index("chat_id", unique=True)
@@ -530,6 +545,111 @@ class Database:
             self.audio_batches.find({"owner_id": owner_id, "status": "ready"})
             .sort("created_at", DESCENDING).limit(limit)
         )
+
+    # ========== PSHARE VAULT ==========
+    # pshare_batches: {batch_id:int, owner_id, status:"draft"|"ready",
+    #   files:[{file_id, type, title, caption}], draft_expires_at (drafts only),
+    #   created_at}
+    # pshare_links:   {key, batch_id, user_id (the ONLY account allowed to
+    #   open it), owner_id, opened_count, blocked_count, last_opened_at,
+    #   created_at}
+
+    def create_pshare_batch(self, owner_id, draft_expires_at):
+        batch_id = self._next_id("pshare_batch")
+        self.pshare_batches.insert_one({
+            "batch_id": batch_id,
+            "owner_id": owner_id,
+            "status": "draft",
+            "files": [],
+            "draft_expires_at": draft_expires_at,
+            "created_at": datetime.utcnow()
+        })
+        return batch_id
+
+    def get_pshare_draft(self, owner_id):
+        return self._clean(self.pshare_batches.find_one(
+            {"owner_id": owner_id, "status": "draft"},
+            sort=[("created_at", DESCENDING)]
+        ))
+
+    def append_pshare_file(self, batch_id, file_info):
+        """Atomic push, only while the batch is still a draft."""
+        return self._clean(self.pshare_batches.find_one_and_update(
+            {"batch_id": batch_id, "status": "draft"},
+            {"$push": {"files": file_info}},
+            return_document=True
+        ))
+
+    def finalize_pshare_batch(self, batch_id):
+        self.pshare_batches.update_one(
+            {"batch_id": batch_id},
+            {"$set": {"status": "ready"}, "$unset": {"draft_expires_at": ""}}
+        )
+
+    def get_pshare_batch(self, batch_id):
+        return self._clean(self.pshare_batches.find_one({"batch_id": batch_id}))
+
+    def list_pshare_batches(self, owner_id, limit=30):
+        batches = self._clean_many(
+            self.pshare_batches.find({"owner_id": owner_id, "status": "ready"})
+            .sort("created_at", DESCENDING).limit(limit)
+        )
+        if batches:
+            counts = {
+                r["_id"]: r["n"] for r in self.pshare_links.aggregate([
+                    {"$match": {"batch_id": {"$in": [b["batch_id"] for b in batches]}}},
+                    {"$group": {"_id": "$batch_id", "n": {"$sum": 1}}}
+                ])
+            }
+            for b in batches:
+                b["link_count"] = counts.get(b["batch_id"], 0)
+        return batches
+
+    def delete_pshare_batch(self, batch_id):
+        """Deleting a batch also kills every link that points to it."""
+        self.pshare_links.delete_many({"batch_id": batch_id})
+        return self.pshare_batches.delete_one({"batch_id": batch_id}).deleted_count > 0
+
+    def get_or_create_pshare_link(self, batch_id, user_id, owner_id, key):
+        """Returns (link_doc, created). Idempotent per (batch, user)."""
+        existing = self.pshare_links.find_one({"batch_id": batch_id, "user_id": user_id})
+        if existing:
+            return self._clean(existing), False
+        doc = {
+            "key": key, "batch_id": batch_id, "user_id": user_id,
+            "owner_id": owner_id, "opened_count": 0, "blocked_count": 0,
+            "last_opened_at": None, "created_at": datetime.utcnow()
+        }
+        try:
+            self.pshare_links.insert_one(dict(doc))
+            return doc, True
+        except DuplicateKeyError:
+            # Lost a race on (batch_id, user_id) -> return the winner.
+            return self._clean(self.pshare_links.find_one(
+                {"batch_id": batch_id, "user_id": user_id})), False
+
+    def pshare_key_exists(self, key):
+        return self.pshare_links.find_one({"key": key}, {"_id": 1}) is not None
+
+    def get_pshare_link(self, key):
+        return self._clean(self.pshare_links.find_one({"key": key}))
+
+    def list_pshare_links(self, batch_id, limit=100):
+        return self._clean_many(
+            self.pshare_links.find({"batch_id": batch_id}).sort("created_at", ASCENDING).limit(limit)
+        )
+
+    def delete_pshare_link(self, key):
+        return self.pshare_links.delete_one({"key": key}).deleted_count > 0
+
+    def touch_pshare_link(self, key):
+        self.pshare_links.update_one(
+            {"key": key},
+            {"$inc": {"opened_count": 1}, "$set": {"last_opened_at": datetime.utcnow()}}
+        )
+
+    def bump_pshare_link_blocked(self, key):
+        self.pshare_links.update_one({"key": key}, {"$inc": {"blocked_count": 1}})
 
     # ========== COPYRIGHT: AUDIT LOG ==========
     def add_audit_log(self, action_type, actor_id, target_user_id, details=""):

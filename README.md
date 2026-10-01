@@ -58,3 +58,23 @@ Opt-in per group. Bot must be a group admin with **Ban users**.
 - Needs `chat_member` updates: already covered by `allowed_updates=Update.ALL_TYPES` in `bot.py`.
 - Main menu / side menu button **🚪 Leave-Ban Guard**: setup help, "Add bot to group" link, and **Mere Groups**
   (per-group status, contact, ON/OFF; bot owner/admins see all groups).
+
+## Private Share (owner only)
+Owner Panel / main menu -> **🔐 Private Share**.
+1. **Naya Batch Upload** -> send any audio / video / document / photo / voice / video note / GIF -> **Done**.
+2. Send one or more user Telegram **user IDs** (space / comma / new line separated) ->
+   the bot creates one private link **per user ID**.
+3. Later: **Mere Batches** -> batch -> **Naye User ke liye Link** (same batch, more users),
+   view opens per user, **Revoke** a single user's link, or delete the whole batch.
+
+Rules enforced in `pshare.py`:
+- Link = `https://t.me/<bot>?start=pl_<random key>`. It is bound to ONE user ID; any other account
+  gets "Ye link aapke account ke liye nahi hai" and receives nothing (attempts are counted).
+- Every file is sent with `protect_content=True` (no forward / save inside Telegram).
+- Same batch + same user ID again returns the existing link (no duplicates).
+- Force-join channel check still runs before delivery.
+- Config: `PSHARE_AUTODELETE_SECONDS` (0 = files stay in user's chat), `PSHARE_DRAFT_TTL_SECONDS`.
+- Mongo collections: `pshare_batches`, `pshare_links`.
+
+Limit: `protect_content` cannot block screenshots / screen recording, and a link is tied to a
+Telegram account, not a person.

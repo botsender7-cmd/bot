@@ -48,6 +48,7 @@ def get_owner_panel():
         [InlineKeyboardButton("📝 Post Update", callback_data="post_update")],
         [InlineKeyboardButton("🛡️ Moderation Panel", callback_data="moderation_panel")],
         [InlineKeyboardButton("🎵 Audio Vault", callback_data="audio_menu")],
+        [InlineKeyboardButton("🔐 Private Share", callback_data="ps_menu")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(buttons)
@@ -282,6 +283,73 @@ def get_audio_detail_keyboard(key):
         [InlineKeyboardButton("🔙 Back", callback_data="audio_list")]
     ]
     return InlineKeyboardMarkup(buttons)
+
+
+# ========== PSHARE VAULT (owner only) ==========
+
+def get_pshare_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬆️ Naya Batch Upload", callback_data="ps_new")],
+        [InlineKeyboardButton("📂 Mere Batches", callback_data="ps_list")],
+        [InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]
+    ])
+
+
+def get_pshare_upload_keyboard(file_count):
+    buttons = []
+    if file_count:
+        buttons.append([InlineKeyboardButton(f"✅ Done ({file_count})", callback_data="ps_done")])
+    buttons.append([InlineKeyboardButton("🗑️ Cancel Batch", callback_data="ps_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_pshare_users_prompt_keyboard(batch_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭️ Baad mein", callback_data=f"ps_b_{batch_id}")]
+    ])
+
+
+def get_pshare_list_keyboard(batches):
+    buttons = []
+    for b in batches:
+        label = f"📦 Batch #{b['batch_id']} • {len(b.get('files', []))} file • {b.get('link_count', 0)} user"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"ps_b_{b['batch_id']}")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="ps_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_pshare_batch_keyboard(batch_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Naye User ke liye Link", callback_data=f"ps_add_{batch_id}")],
+        [InlineKeyboardButton("🔗 Links / Users dekho", callback_data=f"ps_links_{batch_id}")],
+        [InlineKeyboardButton("🗑️ Batch Delete", callback_data=f"ps_delb_{batch_id}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="ps_list")]
+    ])
+
+
+def get_pshare_links_keyboard(batch_id, links):
+    buttons = []
+    for l in links:
+        buttons.append([InlineKeyboardButton(
+            f"👤 {l['user_id']} • {l.get('opened_count', 0)} open",
+            callback_data=f"ps_l_{l['key']}"
+        )])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"ps_b_{batch_id}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_pshare_link_detail_keyboard(key, batch_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 Link Revoke", callback_data=f"ps_rv_{key}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"ps_links_{batch_id}")]
+    ])
+
+
+def get_pshare_delete_confirm_keyboard(batch_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Haan, delete karo", callback_data=f"ps_delby_{batch_id}")],
+        [InlineKeyboardButton("❌ Nahi", callback_data=f"ps_b_{batch_id}")]
+    ])
 
 
 # ========== COPYRIGHT PROTECTION SYSTEM ==========
