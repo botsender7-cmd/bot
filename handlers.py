@@ -857,7 +857,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from group_guard import handle_menu  # lazy: group_guard imports this module
         await handle_menu(update, context, data)
 
-    # ===== PSHARE VAULT (owner only) =====
+    # ===== PRIVATE SHARE (owner + admin; checked inside pshare.py) =====
     elif data.startswith(pshare.CB_PREFIX):
         await pshare.handle_callback(update, context, data)
 

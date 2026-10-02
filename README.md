@@ -59,13 +59,16 @@ Opt-in per group. Bot must be a group admin with **Ban users**.
 - Main menu / side menu button **🚪 Leave-Ban Guard**: setup help, "Add bot to group" link, and **Mere Groups**
   (per-group status, contact, ON/OFF; bot owner/admins see all groups).
 
-## Private Share (owner only)
-Owner Panel / main menu -> **🔐 Private Share**.
+## Private Share (owner + admin)
+Owner Panel or Moderation Panel -> **🔐 Private Share** (not in the main menu).
 1. **Naya Batch Upload** -> send any audio / video / document / photo / voice / video note / GIF -> **Done**.
 2. Send one or more user Telegram **user IDs** (space / comma / new line separated) ->
    the bot creates one private link **per user ID**.
-3. Later: **Mere Batches** -> batch -> **Naye User ke liye Link** (same batch, more users),
+3. **📎 Batch me Nayi File Add**: finished batch me aur items jodo. Is batch ke sab links me nayi file apne aap aa jati hai (jo user pehle khol chuka hai use alag se notify nahi hota, wo link dobara khole to saari files milti hain).
+4. Later: **Mere Batches** -> batch -> **Naye User ke liye Link** (same batch, more users),
    view opens per user, **Revoke** a single user's link, or delete the whole batch.
+
+Access: the owner manages every batch; an admin manages only the batches they created. Admin rights are re-checked on every action, so removing an admin locks them out immediately.
 
 Rules enforced in `pshare.py`:
 - Link = `https://t.me/<bot>?start=pl_<random key>`. It is bound to ONE user ID; any other account

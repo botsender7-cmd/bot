@@ -285,13 +285,15 @@ def get_audio_detail_keyboard(key):
     return InlineKeyboardMarkup(buttons)
 
 
-# ========== PSHARE VAULT (owner only) ==========
+# ========== PRIVATE SHARE (owner + admin) ==========
 
-def get_pshare_menu_keyboard():
+def get_pshare_menu_keyboard(is_owner=True):
+    # owner_panel is owner-only, so admins go back to the moderation panel.
+    back = "owner_panel" if is_owner else "moderation_panel"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⬆️ Naya Batch Upload", callback_data="ps_new")],
         [InlineKeyboardButton("📂 Mere Batches", callback_data="ps_list")],
-        [InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]
+        [InlineKeyboardButton("🔙 Back", callback_data=back)]
     ])
 
 
@@ -303,16 +305,25 @@ def get_pshare_upload_keyboard(file_count):
     return InlineKeyboardMarkup(buttons)
 
 
+def get_pshare_addfiles_keyboard(batch_id):
+    # "Done" just goes back to the batch; nothing is deleted from here.
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Done", callback_data=f"ps_b_{batch_id}")]
+    ])
+
+
 def get_pshare_users_prompt_keyboard(batch_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⏭️ Baad mein", callback_data=f"ps_b_{batch_id}")]
     ])
 
 
-def get_pshare_list_keyboard(batches):
+def get_pshare_list_keyboard(batches, show_creator=False):
     buttons = []
     for b in batches:
         label = f"📦 Batch #{b['batch_id']} • {len(b.get('files', []))} file • {b.get('link_count', 0)} user"
+        if show_creator:
+            label += f" • by {b['owner_id']}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"ps_b_{b['batch_id']}")])
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data="ps_menu")])
     return InlineKeyboardMarkup(buttons)
@@ -321,6 +332,7 @@ def get_pshare_list_keyboard(batches):
 def get_pshare_batch_keyboard(batch_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Naye User ke liye Link", callback_data=f"ps_add_{batch_id}")],
+        [InlineKeyboardButton("📎 Batch me Nayi File Add", callback_data=f"ps_addf_{batch_id}")],
         [InlineKeyboardButton("🔗 Links / Users dekho", callback_data=f"ps_links_{batch_id}")],
         [InlineKeyboardButton("🗑️ Batch Delete", callback_data=f"ps_delb_{batch_id}")],
         [InlineKeyboardButton("🔙 Back", callback_data="ps_list")]
@@ -377,6 +389,7 @@ def get_moderation_panel_keyboard():
         [InlineKeyboardButton("✅ Unban User", callback_data="mod_unban_user")],
         [InlineKeyboardButton("♻️ Reset Strikes", callback_data="mod_reset_strikes")],
         [InlineKeyboardButton("🔍 View User History", callback_data="mod_user_history")],
+        [InlineKeyboardButton("🔐 Private Share", callback_data="ps_menu")],
         [InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]
     ]
     return InlineKeyboardMarkup(buttons)

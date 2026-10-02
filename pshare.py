@@ -1,6 +1,6 @@
 """Private Share.
 
-Owner flow
+Owner / admin flow (owner sees all batches, an admin only their own)
   1. Private Share -> Naya Batch Upload -> send any media (audio / video / document /
      photo / voice / video note / GIF) -> Done.
   2. Send one or more Telegram user IDs -> bot makes ONE private link
@@ -29,7 +29,7 @@ from telegram.ext import ContextTypes
 from config import Config
 from database import db
 from keyboards import (
-    get_pshare_menu_keyboard, get_pshare_upload_keyboard,
+    get_pshare_menu_keyboard, get_pshare_upload_keyboard, get_pshare_addfiles_keyboard,
     get_pshare_users_prompt_keyboard, get_pshare_list_keyboard,
     get_pshare_batch_keyboard, get_pshare_links_keyboard,
     get_pshare_link_detail_keyboard, get_pshare_delete_confirm_keyboard,
@@ -39,6 +39,7 @@ CB_PREFIX = "ps_"
 LINK_PREFIX = "pl_"            # start-payload prefix that marks a pshare link
 STATE_UPLOAD = "pshare_upload"
 STATE_USERS = "pshare_users"
+STATE_ADDFILES = "pshare_addfiles"  # adding items to an already finished batch
 
 _MSG_LIMIT = 3500              # stay under Telegram's 4096-char cap
 _HTML = "HTML"                 # file names may contain _ * ` -> Markdown would break
@@ -46,6 +47,17 @@ _HTML = "HTML"                 # file names may contain _ * ` -> Markdown would 
 
 def is_owner(user_id):
     return user_id == Config.OWNER_ID
+
+
+def can_manage(user_id):
+    """Owner or a CURRENT admin. Checked on every action, so removing an admin
+    cuts off access immediately, even in the middle of an upload."""
+    return is_owner(user_id) or db.get_admin(user_id) is not None
+
+
+def _can_access(batch, user_id):
+    """Owner manages every batch; an admin only the batches they created."""
+    return bool(batch) and (is_owner(user_id) or batch.get("owner_id") == user_id)
 
 
 def is_pshare_state(state):
@@ -145,8 +157,20 @@ def _upload_text(count, last_title=None):
     return text
 
 
+def _addfiles_text(batch_id, total, added, last_title=None):
+    text = (
+        f"📎 <b>Batch #{batch_id}</b> — nayi file(s) add karein\n\n"
+        "Audio / video / document / photo / voice bhejte jayein, sab isi batch me judenge.\n"
+        f"Abhi batch me: <b>{total}</b> file(s)  •  Is baar add hui: <b>{added}</b>\n"
+        "ℹ️ Is batch ke sab links me nayi file apne aap aa jayegi."
+    )
+    if last_title:
+        text += f"\n\n📎 Last saved: {html.escape(last_title)}"
+    return text
+
+
 def _clear_flow(context):
-    for k in ("state", "pshare_batch_id", "pshare_status_chat_id", "pshare_status_msg_id"):
+    for k in ("state", "pshare_batch_id", "pshare_status_chat_id", "pshare_status_msg_id", "pshare_added"):
         context.user_data.pop(k, None)
 
 
@@ -230,8 +254,9 @@ async def handle_pshare_deep_link(update: Update, context: ContextTypes.DEFAULT_
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     query = update.callback_query
     user_id = query.from_user.id
-    if not is_owner(user_id):
+    if not can_manage(user_id):
         return  # callback was already answered upstream; stay silent
+    owner = is_owner(user_id)
 
     cmd, _, arg = data[len(CB_PREFIX):].partition("_")
 
@@ -244,7 +269,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
             b = db.get_pshare_batch(int(arg))
         except ValueError:
             return None
-        return b if b and b.get("owner_id") == user_id else None
+        return b if _can_access(b, user_id) else None
 
     if cmd == "menu":
         _clear_flow(context)
@@ -253,7 +278,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
         if draft and draft.get("files"):
             note = f"\n\n⚠️ Ek adhoora batch hai ({len(draft['files'])} file). Upload dabane par wahin se resume hoga."
         await show("🔐 <b>Private Share</b>\n\nBatch banao → user ID do → har user ka alag private link." + note,
-                   get_pshare_menu_keyboard())
+                   get_pshare_menu_keyboard(owner))
 
     elif cmd == "new":
         draft = db.get_pshare_draft(user_id)
@@ -275,7 +300,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
         batch = db.get_pshare_batch(batch_id) if batch_id else None
         if not batch or not batch.get("files"):
             _clear_flow(context)
-            await show("❌ Abhi tak koi file save nahi hui.", get_pshare_menu_keyboard())
+            await show("❌ Abhi tak koi file save nahi hui.", get_pshare_menu_keyboard(owner))
             return
         db.finalize_pshare_batch(batch_id)
         context.user_data["state"] = STATE_USERS
@@ -298,21 +323,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
             if b and b.get("status") == "draft":
                 db.delete_pshare_batch(batch_id)
         _clear_flow(context)
-        await show("🗑️ Batch cancel ho gaya.", get_pshare_menu_keyboard())
+        await show("🗑️ Batch cancel ho gaya.", get_pshare_menu_keyboard(owner))
 
     elif cmd == "list":
         _clear_flow(context)
-        batches = db.list_pshare_batches(user_id)
+        batches = db.list_pshare_batches(None if owner else user_id)
         if not batches:
-            await show("📂 Abhi koi batch nahi hai.", get_pshare_menu_keyboard())
+            await show("📂 Abhi koi batch nahi hai.", get_pshare_menu_keyboard(owner))
         else:
-            await show("📂 <b>Mere Batches</b>", get_pshare_list_keyboard(batches))
+            await show("📂 <b>Mere Batches</b>", get_pshare_list_keyboard(batches, show_creator=owner))
 
     elif cmd == "b":  # batch detail
         _clear_flow(context)
         b = batch_or_none()
         if not b or b.get("status") != "ready":
-            await show("❌ Batch nahi mila.", get_pshare_menu_keyboard())
+            await show("❌ Batch nahi mila.", get_pshare_menu_keyboard(owner))
             return
         files = b.get("files", [])
         lines = "\n".join(
@@ -331,7 +356,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
     elif cmd == "add":  # more users for an existing batch
         b = batch_or_none()
         if not b or b.get("status") != "ready":
-            await show("❌ Batch nahi mila.", get_pshare_menu_keyboard())
+            await show("❌ Batch nahi mila.", get_pshare_menu_keyboard(owner))
             return
         context.user_data["state"] = STATE_USERS
         context.user_data["pshare_batch_id"] = b["batch_id"]
@@ -341,11 +366,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
             get_pshare_users_prompt_keyboard(b["batch_id"])
         )
 
+    elif cmd == "addf":  # add items to an existing, finished batch
+        b = batch_or_none()
+        if not b or b.get("status") != "ready":
+            await show("❌ Batch nahi mila.", get_pshare_menu_keyboard(owner))
+            return
+        context.user_data["state"] = STATE_ADDFILES
+        context.user_data["pshare_batch_id"] = b["batch_id"]
+        context.user_data["pshare_added"] = 0
+        await show(_addfiles_text(b["batch_id"], len(b.get("files", [])), 0),
+                   get_pshare_addfiles_keyboard(b["batch_id"]))
+        context.user_data["pshare_status_chat_id"] = query.message.chat_id
+        context.user_data["pshare_status_msg_id"] = query.message.message_id
+
     elif cmd == "links":
         _clear_flow(context)
         b = batch_or_none()
         if not b:
-            await show("❌ Batch nahi mila.", get_pshare_menu_keyboard())
+            await show("❌ Batch nahi mila.", get_pshare_menu_keyboard(owner))
             return
         links = db.list_pshare_links(b["batch_id"])
         if not links:
@@ -357,8 +395,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
 
     elif cmd == "l":  # one link
         link = db.get_pshare_link(arg)
-        if not link or link.get("owner_id") != user_id:
-            await show("❌ Link nahi mila (revoke ho chuka hoga).", get_pshare_menu_keyboard())
+        if not link or not _can_access(db.get_pshare_batch(link["batch_id"]), user_id):
+            await show("❌ Link nahi mila (revoke ho chuka hoga).", get_pshare_menu_keyboard(owner))
             return
         last = link.get("last_opened_at")
         blocked = link.get("blocked_count", 0)
@@ -374,17 +412,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
 
     elif cmd == "rv":
         link = db.get_pshare_link(arg)
-        if link and link.get("owner_id") == user_id:
+        if link and _can_access(db.get_pshare_batch(link["batch_id"]), user_id):
             db.delete_pshare_link(arg)
             await show(f"🚫 User <code>{link['user_id']}</code> ka link revoke ho gaya. Ab ye kaam nahi karega.",
                        get_pshare_batch_keyboard(link["batch_id"]))
         else:
-            await show("❌ Link pehle hi nahi hai.", get_pshare_menu_keyboard())
+            await show("❌ Link pehle hi nahi hai.", get_pshare_menu_keyboard(owner))
 
     elif cmd == "delb":  # ask first
         b = batch_or_none()
         if not b:
-            await show("❌ Batch nahi mila.", get_pshare_menu_keyboard())
+            await show("❌ Batch nahi mila.", get_pshare_menu_keyboard(owner))
             return
         n = len(db.list_pshare_links(b["batch_id"]))
         await show(f"⚠️ Batch #{b['batch_id']} delete karein?\nIske {n} link bhi band ho jayenge.",
@@ -392,9 +430,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
 
     elif cmd == "delby":
         b = batch_or_none()
-        if b:
-            db.delete_pshare_batch(b["batch_id"])
-        await show("🗑️ Batch aur uske sab links delete ho gaye.", get_pshare_menu_keyboard())
+        if not b:
+            await show("❌ Batch nahi mila.", get_pshare_menu_keyboard(owner))
+            return
+        db.delete_pshare_batch(b["batch_id"])
+        await show("🗑️ Batch aur uske sab links delete ho gaye.", get_pshare_menu_keyboard(owner))
 
 
 # ------------------------------------------------------- owner: messages
@@ -403,36 +443,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
     """Called from message_handler when user_data['state'] is a pshare state.
     Returns True if the message was consumed."""
     user = update.effective_user
-    if not is_owner(user.id):
+    if not can_manage(user.id):
         _clear_flow(context)
         return False
 
     batch_id = context.user_data.get("pshare_batch_id")
 
     # ----- upload -----
-    if state == STATE_UPLOAD:
+    if state in (STATE_UPLOAD, STATE_ADDFILES):
+        adding = state == STATE_ADDFILES
         media = _extract_media(update.message)
         if not media:
             await update.message.reply_text("❌ Koi audio / video / document / photo bhejein.")
             return True
         batch = db.get_pshare_batch(batch_id) if batch_id else None
-        if not batch or batch.get("status") != "draft":
+        if not _can_access(batch, user.id) or batch.get("status") != ("ready" if adding else "draft"):
             _clear_flow(context)
             await update.message.reply_text("❌ Batch nahi mila, Private Share menu se dobara shuru karein.",
-                                            reply_markup=get_pshare_menu_keyboard())
+                                            reply_markup=get_pshare_menu_keyboard(is_owner(user.id)))
             return True
         kind, file_id, title = media
         title = title or update.message.caption or f"{kind}_{len(batch.get('files', [])) + 1}"
-        updated = db.append_pshare_file(batch_id, {"file_id": file_id, "type": kind, "title": title})
-        count = len(updated.get("files", [])) if updated else 0
+        updated = db.append_pshare_file(batch_id, {"file_id": file_id, "type": kind, "title": title},
+                                        status="ready" if adding else "draft")
+        if not updated:  # batch was deleted / changed while uploading
+            _clear_flow(context)
+            await update.message.reply_text("❌ Batch ab available nahi hai.",
+                                            reply_markup=get_pshare_menu_keyboard(is_owner(user.id)))
+            return True
+        count = len(updated.get("files", []))
+        if adding:
+            context.user_data["pshare_added"] = context.user_data.get("pshare_added", 0) + 1
 
         try:  # keep the chat tidy: only the status message should move
             await update.message.delete()
         except Exception:
             pass
 
-        text = _upload_text(count, title)
-        markup = get_pshare_upload_keyboard(count)
+        if adding:
+            text = _addfiles_text(batch_id, count, context.user_data.get("pshare_added", 0), title)
+            markup = get_pshare_addfiles_keyboard(batch_id)
+        else:
+            text = _upload_text(count, title)
+            markup = get_pshare_upload_keyboard(count)
         chat_id = context.user_data.get("pshare_status_chat_id")
         msg_id = context.user_data.get("pshare_status_msg_id")
         edited = False
@@ -452,9 +505,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
     # ----- user IDs -> links -----
     if state == STATE_USERS:
         batch = db.get_pshare_batch(batch_id) if batch_id else None
-        if not batch or batch.get("status") != "ready":
+        if not _can_access(batch, user.id) or batch.get("status") != "ready":
             _clear_flow(context)
-            await update.message.reply_text("❌ Batch nahi mila.", reply_markup=get_pshare_menu_keyboard())
+            await update.message.reply_text("❌ Batch nahi mila.", reply_markup=get_pshare_menu_keyboard(is_owner(user.id)))
             return True
 
         ids, bad = _parse_user_ids(update.message.text)

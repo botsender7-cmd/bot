@@ -572,10 +572,11 @@ class Database:
             sort=[("created_at", DESCENDING)]
         ))
 
-    def append_pshare_file(self, batch_id, file_info):
-        """Atomic push, only while the batch is still a draft."""
+    def append_pshare_file(self, batch_id, file_info, status="draft"):
+        """Atomic push. status="draft" while building a new batch,
+        status="ready" to add an item to an already finished batch."""
         return self._clean(self.pshare_batches.find_one_and_update(
-            {"batch_id": batch_id, "status": "draft"},
+            {"batch_id": batch_id, "status": status},
             {"$push": {"files": file_info}},
             return_document=True
         ))
@@ -589,10 +590,13 @@ class Database:
     def get_pshare_batch(self, batch_id):
         return self._clean(self.pshare_batches.find_one({"batch_id": batch_id}))
 
-    def list_pshare_batches(self, owner_id, limit=30):
+    def list_pshare_batches(self, owner_id=None, limit=30):
+        """owner_id=None -> every ready batch (used for the bot owner)."""
+        q = {"status": "ready"}
+        if owner_id is not None:
+            q["owner_id"] = owner_id
         batches = self._clean_many(
-            self.pshare_batches.find({"owner_id": owner_id, "status": "ready"})
-            .sort("created_at", DESCENDING).limit(limit)
+            self.pshare_batches.find(q).sort("created_at", DESCENDING).limit(limit)
         )
         if batches:
             counts = {
