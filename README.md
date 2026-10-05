@@ -1,4 +1,4 @@
-# Telegram Bot (no AI/QR code here) — deploys to Render (webhook mode)
+# Telegram Bot (AI/QR code here) — deploys (webhook mode)
 
 This service only talks to Telegram + the database directly. AI chat and
 QR code generation are NOT implemented here — both are called over HTTP
