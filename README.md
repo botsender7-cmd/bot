@@ -81,3 +81,60 @@ Rules enforced in `pshare.py`:
 
 Limit: `protect_content` cannot block screenshots / screen recording, and a link is tied to a
 Telegram account, not a person.
+
+## Contact Owner (users -> owner, owner replies back)
+Main menu / side menu button **📬 Owner se Contact** (hidden for the owner).
+- User taps it and sends anything (text / photo / voice / file ...). The owner receives a small
+  header (name, @username, ID, **🚫 Block user** button) plus the original message.
+- Owner **replies** to the header or to the copied message -> the reply reaches that user as
+  "📨 Owner ka jawab" with a **✉️ Jawab do** button, so the user can answer back in one tap.
+- **🚫 Block / ✅ Unblock** under every header. This is separate from the global ban.
+- Only `OWNER_ID` receives contact messages. The owner must have started the bot once (Telegram rule).
+- Force-join channel check still applies before a user can open it.
+- Flood guard: `CONTACT_RATE_LIMIT` messages per `CONTACT_RATE_WINDOW` seconds per user (in memory).
+- Reply mapping is stored in Mongo (`contact_msgs`, auto-deleted after `CONTACT_MAP_TTL_DAYS` = 30 days, so the
+  owner can't reply to older messages); blocks in `contact_blocked`.
+- Code: `contact.py`; hooks in `handlers.py` (callback route + top of `message_handler`), `keyboards.py`, `database.py`, `config.py`.
+- Limit: the owner's reply is text-only for text (bold/links typed by the owner are sent as plain text).
+
+## Contact-bot clones (users make their own contact bot)
+In **📬 Owner se Contact** -> **🤖 Apna Contact Bot Banao**. The user creates a bot in @BotFather, pastes
+the token, presses Start on the new bot once, and from then on anyone who messages *that* bot reaches *that user*
+(same reply / 🚫 Block flow as above, `/ban` + `/unban` also work). Code: `clone.py`.
+
+New env vars
+- `ENCRYPTION_KEY` — **required to enable the feature** (button stays hidden without it). Generate:
+  `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
+  Lose it and every saved token is unreadable, so back it up somewhere separate from the database.
+- `MAX_CLONES` — total cap, default 50. One clone per user.
+
+How it works
+- Tokens are Fernet-encrypted in Mongo (`clones`); reply mappings in `clone_msgs` (30-day TTL), blocks in `clone_blocked`.
+- Each clone runs as its own polling Application inside this process (started in `post_init`, stopped in `post_shutdown`).
+- The user's token message is deleted right after it is read. Users can remove their clone anytime (**🗑️ Clone hatao**),
+  which deletes the token and its data. They should also `/revoke` the token in BotFather.
+- Bot owner: **Owner Panel -> 🤖 Contact Clones** lists every clone and can remove any of them (logged in `audit_log`).
+- `httpx` logging is set to WARNING in `bot.py` because its INFO lines contain bot tokens.
+
+Read before enabling
+- **Webhook + sleeping host:** this bot uses a webhook, but clones use polling. On Render's free tier the service
+  sleeps after ~15 min without HTTP traffic, and then **all clones stop receiving messages** until it wakes. Use an
+  always-on plan (or an uptime pinger hitting the service URL) if clones matter.
+- **Custody:** whoever has the server env (`ENCRYPTION_KEY`) and the database can decrypt every token. Users are told this.
+- **Abuse:** a clone is a bot you host. People can use one to message strangers. You are the one who can remove it (see above).
+- Polling dozens of bots in one process is fine; hundreds is not (needs webhooks or separate workers).
+- Clones can't message their owner until the owner presses Start on the clone once (Telegram rule).
+
+## Clone: auto-delete + delete for both sides
+Set by the clone's owner **inside the clone bot** (owner only).
+- `/autodelete` -> buttons (30s, 1m, 5m, 15m, 1h, 6h, 24h, 48h, Off), or type `/autodelete 45m` (`s`/`m`/`h`/`d`; min 10s, max 48h; `off` to stop).
+- When ON, every message that clone handles is deleted after that time **in both chats**: header + copy of the user's message and the owner's own replies/notes (owner chat), the user's original message, the "✅ pahunch gaya" note and the owner's reply copy (user chat). Reply mappings in Mongo are removed with them. Users are told in `/start`.
+- Turning it **Off** also cancels deletions that were still pending.
+- The queue is in Mongo (`clone_autodel`) and one sweeper task works through it every `CLONE_AUTODEL_SWEEP_SECONDS`, so pending deletions survive restarts (unlike the in-memory timers in Audio Vault / Private Share). If the host is asleep, deletions happen when it wakes.
+- Telegram only lets a bot delete messages **younger than 48h**, hence the 48h cap. A message that is already gone is simply skipped.
+
+**Delete for both sides.** Telegram does not tell bots when someone deletes a message in a private chat, so deleting it by hand in your own chat cannot be detected. Use either:
+- the **🗑 Dono taraf delete** button under "✅ Bhej diya", or
+- `/del` as a reply to your sent message (or to the "✅ Bhej diya" note).
+
+Both remove the copy from the user's chat first; only if that succeeds are your message and the note removed too. If the user's copy is older than 48h or already gone, you get an error and nothing else is touched. Mapping lives in `clone_sent` (47h TTL).

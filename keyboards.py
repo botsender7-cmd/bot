@@ -17,6 +17,8 @@ def get_main_menu(user_id):
     ])
 
     buttons.append([InlineKeyboardButton("🚪 Leave-Ban Guard", callback_data="leaveban_menu")])
+    if user_id != Config.OWNER_ID:
+        buttons.append([InlineKeyboardButton("📬 Owner se Contact", callback_data="ct_open")])
 
     is_admin = user_id in [a["user_id"] for a in __import__('database').db.get_all_admins()]
     is_owner = user_id == Config.OWNER_ID
@@ -49,6 +51,7 @@ def get_owner_panel():
         [InlineKeyboardButton("🛡️ Moderation Panel", callback_data="moderation_panel")],
         [InlineKeyboardButton("🎵 Audio Vault", callback_data="audio_menu")],
         [InlineKeyboardButton("🔐 Private Share", callback_data="ps_menu")],
+        [InlineKeyboardButton("🤖 Contact Clones", callback_data="cl_list")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(buttons)
@@ -208,6 +211,7 @@ def get_side_menu(user_id):
         [InlineKeyboardButton("📢 Bot Updates", callback_data="bot_updates")],
         [InlineKeyboardButton("📨 My Scheduled", callback_data="my_scheduled")],
         [InlineKeyboardButton("🚪 Leave-Ban Guard", callback_data="leaveban_menu")],
+        [InlineKeyboardButton("📬 Owner se Contact", callback_data="ct_open")],
         [InlineKeyboardButton("❓ Help", callback_data="help")],
         [InlineKeyboardButton("❌ Close", callback_data="close")]
     ]
@@ -402,4 +406,28 @@ def get_report_detail_keyboard(report_id, reported_user_id):
         [InlineKeyboardButton("🔙 Back", callback_data="mod_view_reports")]
     ]
     return InlineKeyboardMarkup(buttons)
+
+# ===== Contact Owner (contact.py) =====
+def get_contact_prompt_keyboard(show_clone=False):
+    """show_clone adds the "make your own contact bot" entry (clone.py), only on
+    the first prompt and only when the feature is configured (ENCRYPTION_KEY)."""
+    rows = []
+    if show_clone and Config.CLONES_ENABLED:
+        rows.append([InlineKeyboardButton("🤖 Apna Contact Bot Banao", callback_data="cl_menu")])
+    rows.append([InlineKeyboardButton("❌ Band karo", callback_data="ct_stop")])
+    return InlineKeyboardMarkup(rows)
+
+def get_contact_reply_keyboard():
+    """Under the owner's reply, so the user can answer back in one tap."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✉️ Jawab do", callback_data="ct_reply")]
+    ])
+
+def get_contact_block_keyboard(user_id, blocked):
+    """Under the header the owner receives. Flips between Block / Unblock."""
+    if blocked:
+        btn = InlineKeyboardButton("✅ Unblock user", callback_data=f"ct_ubk_{user_id}")
+    else:
+        btn = InlineKeyboardButton("🚫 Block user", callback_data=f"ct_blk_{user_id}")
+    return InlineKeyboardMarkup([[btn]])
 

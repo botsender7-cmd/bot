@@ -10,6 +10,8 @@ import api_client
 from keyboards import *
 from scheduler import scheduler
 import pshare
+import contact
+import clone
 from datetime import datetime, timedelta, timezone, date
 
 USER_CHANNEL_ADD = 999
@@ -861,6 +863,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith(pshare.CB_PREFIX):
         await pshare.handle_callback(update, context, data)
 
+    # ===== CONTACT OWNER (users; block/unblock owner-only inside contact.py) =====
+    elif data.startswith(contact.CB_PREFIX):
+        await contact.handle_callback(update, context, data)
+
+    # ===== CONTACT-BOT CLONES (users: own clone; list/kill owner-only inside clone.py) =====
+    elif data.startswith(clone.CB_PREFIX):
+        await clone.handle_callback(update, context, data)
+
     # ===== AUDIO VAULT (owner only) =====
     elif data == "audio_menu":
         if not is_owner(user_id):
@@ -1496,6 +1506,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text  # None for media messages — checked below per-type
     state = context.user_data.get("state")
+
+    # ----- Contact Owner -----
+    # Owner replying to a forwarded user message. Only consumes the message when
+    # the replied-to message is a known contact message; everything else falls through.
+    if await contact.handle_owner_reply(update, context):
+        return
+    # User writing to the owner (entered via "📬 Owner se Contact").
+    if state == contact.STATE_MSG:
+        if await contact.handle_user_message(update, context):
+            return
+    # User pasting a BotFather token to create their own contact bot (clone.py).
+    if state == clone.STATE_TOKEN:
+        if await clone.handle_token(update, context):
+            return
 
     # ----- Private Share (owner only): batch upload + user user IDs -----
     if pshare.is_pshare_state(state):

@@ -105,3 +105,35 @@ class Config:
     PSHARE_AUTODELETE_SECONDS = 0
     # Random part of the link key (9 bytes ~ 72 bits).
     PSHARE_KEY_BYTES = 9
+
+    # ===== Contact Owner (user -> owner messages, owner replies back) =====
+    TABLE_CONTACT_MSGS = "contact_msgs"
+    TABLE_CONTACT_BLOCKED = "contact_blocked"
+    # owner-message-id -> user-id mapping is deleted after this many days
+    # (the owner can no longer reply to messages older than that).
+    CONTACT_MAP_TTL_DAYS = 30
+    # Per-user flood guard: at most N messages per WINDOW seconds.
+    CONTACT_RATE_LIMIT = 5
+    CONTACT_RATE_WINDOW = 10
+
+    # ===== Contact-bot clones (clone.py) =====
+    # Users paste their own BotFather token and get their own contact bot.
+    # Tokens are Fernet-encrypted in Mongo. Without ENCRYPTION_KEY the feature is off.
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Losing the key makes every saved token unreadable - keep a backup.
+    ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+    CLONES_ENABLED = bool(ENCRYPTION_KEY)
+    MAX_CLONES = int(os.getenv("MAX_CLONES", "50"))
+    TABLE_CLONES = "clones"
+    TABLE_CLONE_MSGS = "clone_msgs"
+    TABLE_CLONE_BLOCKED = "clone_blocked"
+
+    # ===== Clone auto-delete + "delete for both sides" =====
+    # Owner of a clone sets the timer with /autodelete inside the clone bot.
+    TABLE_CLONE_AUTODEL = "clone_autodel"   # persistent delete queue (survives restarts)
+    TABLE_CLONE_SENT = "clone_sent"         # owner reply -> user's copy (for /del + button)
+    CLONE_AUTODEL_MIN_SECONDS = 10
+    # Telegram only lets a bot delete messages younger than 48h.
+    CLONE_AUTODEL_MAX_SECONDS = 48 * 60 * 60
+    CLONE_AUTODEL_SWEEP_SECONDS = 10
+    CLONE_SENT_TTL_HOURS = 47

@@ -12,6 +12,7 @@ from handlers import (start, side_menu, help_command, callback_handler, message_
 chat_join_request, menu_command, handle_join_request, join_request, skip_command,
 combined_join_request_handler, report_command)
 from scheduler import init_scheduler, reschedule_pending_messages
+import clone
 from group_guard import (on_member_update, unban_button, unban_command,
                          leaveban_command, contact_reply, private_help, CB_PREFIX)
 from telegram.error import BadRequest, NetworkError, TimedOut
@@ -21,6 +22,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+# httpx logs every request URL at INFO, and Telegram URLs contain the bot token
+# (this bot's and every clone's). Keep those lines out of the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 async def post_init(application):
     logger.info("SETTING COMMANDS...")
@@ -54,6 +58,13 @@ async def post_init(application):
 
     # Restore any 'pending' scheduled messages from DB into APScheduler.
     await reschedule_pending_messages()
+
+    # Bring every user's contact-bot clone back up (polling, same event loop).
+    await clone.start_all()
+
+
+async def post_shutdown(application):
+    await clone.stop_all()
 
 def main():
     proxy_url = os.getenv("TELEGRAM_PROXY_URL")
@@ -96,6 +107,7 @@ def main():
     # Do NOT call init_scheduler here in sync main().
 
     application.post_init = post_init
+    application.post_shutdown = post_shutdown
 
     # Command Handlers
     application.add_handler(CommandHandler("start", start))

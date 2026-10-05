@@ -34,6 +34,13 @@ class Database:
         self.leaveban_groups = self.db[Config.TABLE_LEAVEBAN_GROUPS]
         self.pshare_batches = self.db[Config.TABLE_PSHARE_BATCHES]
         self.pshare_links = self.db[Config.TABLE_PSHARE_LINKS]
+        self.contact_msgs = self.db[Config.TABLE_CONTACT_MSGS]
+        self.contact_blocked = self.db[Config.TABLE_CONTACT_BLOCKED]
+        self.clones = self.db[Config.TABLE_CLONES]
+        self.clone_msgs = self.db[Config.TABLE_CLONE_MSGS]
+        self.clone_blocked = self.db[Config.TABLE_CLONE_BLOCKED]
+        self.clone_autodel = self.db[Config.TABLE_CLONE_AUTODEL]
+        self.clone_sent = self.db[Config.TABLE_CLONE_SENT]
 
         # Fail fast if the connection string / cluster is unreachable, same
         # spirit as the old pool creation failing loudly on bad DSNs.
@@ -74,6 +81,47 @@ class Database:
             self.pshare_batches.create_index("draft_expires_at", expireAfterSeconds=0)
         except Exception as e:
             print(f"[WARN] pshare_batches TTL index not created: {e}")
+
+        # ----- Contact Owner -----
+        self.contact_msgs.create_index("owner_msg_id", unique=True)
+        self.contact_blocked.create_index("user_id", unique=True)
+        try:
+            self.contact_msgs.create_index(
+                "created_at", expireAfterSeconds=Config.CONTACT_MAP_TTL_DAYS * 86400
+            )
+        except Exception as e:
+            print(f"[WARN] contact_msgs TTL index not created: {e}")
+
+        # ----- Contact-bot clones -----
+        self.clones.create_index("bot_id", unique=True)
+        self.clones.create_index("owner_id", unique=True)  # one clone per user
+        self.clone_msgs.create_index(
+            [("bot_id", ASCENDING), ("owner_msg_id", ASCENDING)], unique=True
+        )
+        self.clone_blocked.create_index(
+            [("bot_id", ASCENDING), ("user_id", ASCENDING)], unique=True
+        )
+        try:
+            self.clone_msgs.create_index(
+                "created_at", expireAfterSeconds=Config.CONTACT_MAP_TTL_DAYS * 86400
+            )
+        except Exception as e:
+            print(f"[WARN] clone_msgs TTL index not created: {e}")
+
+        self.clone_autodel.create_index(
+            [("bot_id", ASCENDING), ("chat_id", ASCENDING), ("message_id", ASCENDING)], unique=True
+        )
+        self.clone_autodel.create_index("delete_at")
+        self.clone_sent.create_index(
+            [("bot_id", ASCENDING), ("owner_msg_id", ASCENDING)], unique=True
+        )
+        self.clone_sent.create_index([("bot_id", ASCENDING), ("confirm_msg_id", ASCENDING)])
+        try:
+            self.clone_sent.create_index(
+                "created_at", expireAfterSeconds=Config.CLONE_SENT_TTL_HOURS * 3600
+            )
+        except Exception as e:
+            print(f"[WARN] clone_sent TTL index not created: {e}")
 
         # ----- Leave-Ban Guard -----
         self.leaveban_groups.create_index("chat_id", unique=True)
@@ -704,6 +752,130 @@ class Database:
     def is_leaveban_enabled(self, chat_id):
         doc = self.get_leaveban(chat_id)
         return bool(doc and doc.get("enabled"))
+
+    # ========== CONTACT OWNER ==========
+    def save_contact_map(self, owner_msg_id, user_id):
+        """Remember which user a message in the owner's chat came from."""
+        self.contact_msgs.update_one(
+            {"owner_msg_id": owner_msg_id},
+            {"$set": {"user_id": user_id, "created_at": datetime.utcnow()}},
+            upsert=True,
+        )
+
+    def get_contact_user(self, owner_msg_id):
+        doc = self.contact_msgs.find_one({"owner_msg_id": owner_msg_id})
+        return doc["user_id"] if doc else None
+
+    def is_contact_blocked(self, user_id):
+        return self.contact_blocked.find_one({"user_id": user_id}) is not None
+
+    def set_contact_blocked(self, user_id, blocked=True):
+        if blocked:
+            self.contact_blocked.update_one(
+                {"user_id": user_id},
+                {"$set": {"user_id": user_id, "blocked_at": datetime.utcnow()}},
+                upsert=True,
+            )
+        else:
+            self.contact_blocked.delete_one({"user_id": user_id})
+
+    # ========== CONTACT-BOT CLONES ==========
+    def add_clone(self, bot_id, owner_id, username, token_enc):
+        """Raises DuplicateKeyError if the bot or the owner already has a clone."""
+        self.clones.insert_one({
+            "bot_id": bot_id, "owner_id": owner_id, "username": username,
+            "token_enc": token_enc, "created_at": datetime.utcnow(),
+        })
+
+    def get_clone(self, bot_id):
+        return self._clean(self.clones.find_one({"bot_id": bot_id}))
+
+    def get_clone_by_owner(self, owner_id):
+        return self._clean(self.clones.find_one({"owner_id": owner_id}))
+
+    def list_clones(self):
+        return self._clean_many(self.clones.find({}).sort("created_at", ASCENDING))
+
+    def count_clones(self):
+        return self.clones.count_documents({})
+
+    def delete_clone(self, bot_id):
+        """Removes the clone with its token, reply mappings and blocks."""
+        self.clones.delete_one({"bot_id": bot_id})
+        self.clone_msgs.delete_many({"bot_id": bot_id})
+        self.clone_blocked.delete_many({"bot_id": bot_id})
+        self.clone_autodel.delete_many({"bot_id": bot_id})
+        self.clone_sent.delete_many({"bot_id": bot_id})
+
+    def save_clone_map(self, bot_id, owner_msg_id, user_id):
+        self.clone_msgs.update_one(
+            {"bot_id": bot_id, "owner_msg_id": owner_msg_id},
+            {"$set": {"user_id": user_id, "created_at": datetime.utcnow()}},
+            upsert=True,
+        )
+
+    def get_clone_user(self, bot_id, owner_msg_id):
+        doc = self.clone_msgs.find_one({"bot_id": bot_id, "owner_msg_id": owner_msg_id})
+        return doc["user_id"] if doc else None
+
+    def is_clone_blocked(self, bot_id, user_id):
+        return self.clone_blocked.find_one({"bot_id": bot_id, "user_id": user_id}) is not None
+
+    def set_clone_blocked(self, bot_id, user_id, blocked=True):
+        if blocked:
+            self.clone_blocked.update_one(
+                {"bot_id": bot_id, "user_id": user_id},
+                {"$set": {"blocked_at": datetime.utcnow()}},
+                upsert=True,
+            )
+        else:
+            self.clone_blocked.delete_one({"bot_id": bot_id, "user_id": user_id})
+
+    # ----- clone auto-delete queue -----
+    def set_clone_autodel(self, bot_id, seconds):
+        self.clones.update_one({"bot_id": bot_id}, {"$set": {"autodel_seconds": int(seconds)}})
+
+    def queue_clone_autodel(self, bot_id, chat_id, message_id, seconds, owner_chat=False):
+        self.clone_autodel.update_one(
+            {"bot_id": bot_id, "chat_id": chat_id, "message_id": message_id},
+            {"$set": {"delete_at": datetime.utcnow() + timedelta(seconds=seconds),
+                      "owner_chat": owner_chat}},
+            upsert=True,
+        )
+
+    def due_clone_autodel(self, limit=100):
+        """Raw docs (with _id) so the sweeper can drop exactly the ones it handled."""
+        return list(self.clone_autodel.find(
+            {"delete_at": {"$lte": datetime.utcnow()}}
+        ).sort("delete_at", ASCENDING).limit(limit))
+
+    def drop_clone_autodel(self, doc_id):
+        self.clone_autodel.delete_one({"_id": doc_id})
+
+    def clear_clone_autodel(self, bot_id):
+        self.clone_autodel.delete_many({"bot_id": bot_id})
+
+    def delete_clone_map(self, bot_id, owner_msg_id):
+        self.clone_msgs.delete_one({"bot_id": bot_id, "owner_msg_id": owner_msg_id})
+
+    # ----- clone: owner reply -> user's copy (delete for both sides) -----
+    def save_clone_sent(self, bot_id, owner_msg_id, confirm_msg_id, user_id, user_msg_id):
+        self.clone_sent.update_one(
+            {"bot_id": bot_id, "owner_msg_id": owner_msg_id},
+            {"$set": {"confirm_msg_id": confirm_msg_id, "user_id": user_id,
+                      "user_msg_id": user_msg_id, "created_at": datetime.utcnow()}},
+            upsert=True,
+        )
+
+    def find_clone_sent(self, bot_id, msg_id):
+        """Match by the owner's own message id OR the bot's '✅ Bhej diya' message id."""
+        return self._clean(self.clone_sent.find_one({
+            "bot_id": bot_id,
+            "$or": [{"owner_msg_id": msg_id}, {"confirm_msg_id": msg_id}],
+        }))
+
+    def delete_clone_sent(self, bot_id, owner_msg_id):
+        self.clone_sent.delete_one({"bot_id": bot_id, "owner_msg_id": owner_msg_id})
 
 
 db = Database()
