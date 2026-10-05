@@ -10,7 +10,7 @@ How it runs
     mode inside this same process / event loop (started from bot.py post_init).
   * Tokens are Fernet-encrypted in MongoDB (`clones`). Needs env ENCRYPTION_KEY;
     without it the feature stays off and nothing else is affected.
-  * One clone per user, at most Config.MAX_CLONES in total.
+  * One clone per normal user (at most Config.MAX_CLONES in total); the bot owner may add unlimited clones from Owner Panel.
   * The bot owner (Config.OWNER_ID) can list / remove clones: Owner Panel -> 🤖 Contact Clones.
 
 Auto-delete (per clone, set by the clone's owner inside the clone bot)
@@ -223,7 +223,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
     cmd, _, arg = data[len(CB_PREFIX):].partition("_")
 
     if cmd == "menu":
-        await _show_menu(query, context, user)
+        if is_owner(user.id):  # owner can have many clones -> manage them from the list
+            context.user_data["state"] = None
+            await _show_list(query)
+        else:
+            await _show_menu(query, context, user)
 
     elif cmd == "off":
         if db.get_clone_by_owner(user.id):
@@ -253,31 +257,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
             return
         if not enabled():
             await query.edit_message_text(
-                "🤖 Clone feature chalu nahi hai (ENCRYPTION_KEY set nahi hai).",
+                "🔑 <b>ENCRYPTION_KEY set nahi hai</b>, isliye clones band hain.\n\n"
+                "1. Key banao (apne PC/Termux par):\n"
+                "<code>python -c \"from cryptography.fernet import Fernet; "
+                "print(Fernet.generate_key().decode())\"</code>\n"
+                "2. Hosting ke Environment Variables me <code>ENCRYPTION_KEY</code> naam se "
+                "wo key daalo aur bot restart karo.\n\n"
+                "⚠️ Key ka backup rakho. Key kho gayi to saved tokens kabhi decrypt nahi honge.",
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("🔙 Back", callback_data="cl_list")]]),
-            )
-            return
-        if db.get_clone_by_owner(user.id):
-            await query.edit_message_text(
-                "ℹ️ Aapka apna clone pehle se bana hua hai (ek user = ek clone). "
-                "Naya add karne ke liye pehle use list se hata do.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🔙 Back", callback_data="cl_list")]]),
-            )
-            return
-        if db.count_clones() >= Config.MAX_CLONES:
-            await query.edit_message_text(
-                f"❌ Limit poori ho gayi ({Config.MAX_CLONES}). MAX_CLONES env badhao.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🔙 Back", callback_data="cl_list")]]),
+                parse_mode="HTML",
             )
             return
         context.user_data["state"] = STATE_TOKEN
         await query.edit_message_text(
             "➕ <b>Clone add karo</b>\n\n"
             "@BotFather se naye bot ka token lo aur <b>yahan bhejo</b>. "
-            "Bot aapka (owner ka) contact bot ban jaayega. "
+            "Bot aapka (owner ka) contact bot ban jaayega. Aap jitne chaho utne add kar sakte ho. "
             "Phir us bot me ek baar <b>Start</b> dabana mat bhoolna.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Cancel", callback_data="cl_list")]]),
@@ -358,12 +354,13 @@ async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     if not enabled():
         await say("🤖 Ye feature abhi chalu nahi hai.")
         return True
-    if db.get_clone_by_owner(user.id):
-        await say("Aapka clone pehle se bana hua hai. Naya banane ke liye pehle use hatao.")
-        return True
-    if db.count_clones() >= Config.MAX_CLONES:
-        await say("❌ Abhi naye clones ki limit poori ho gayi hai.")
-        return True
+    if not is_owner(user.id):  # normal users: 1 clone each, global cap. Owner: unlimited.
+        if db.get_clone_by_owner(user.id):
+            await say("Aapka clone pehle se bana hua hai. Naya banane ke liye pehle use hatao.")
+            return True
+        if db.count_clones() >= Config.MAX_CLONES:
+            await say("❌ Abhi naye clones ki limit poori ho gayi hai.")
+            return True
     if text == Config.BOT_TOKEN:
         await say("❌ Ye is bot ka hi token hai. Apna naya bot banao.")
         return True
@@ -398,7 +395,12 @@ async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
         "Uske baad jo bhi us bot ko message karega, wo aapko usi chat mein milega. "
         "Jawab dene ke liye message par reply karo.",
         disable_web_page_preview=True,
+        reply_markup=(InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🤖 Clones list", callback_data="cl_list")]])
+            if is_owner(user.id) else None),
     )
+    if is_owner(user.id):
+        return True
     try:
         await context.bot.send_message(
             Config.OWNER_ID, f"🤖 Naya clone: @{info.username} (owner ID {user.id})"

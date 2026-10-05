@@ -94,7 +94,16 @@ class Database:
 
         # ----- Contact-bot clones -----
         self.clones.create_index("bot_id", unique=True)
-        self.clones.create_index("owner_id", unique=True)  # one clone per user
+        # One clone per normal user is enforced in clone.py; the bot owner may have many,
+        # so owner_id must NOT be unique. Old deployments have a unique owner_id_1 index:
+        # drop it once, then create the plain one.
+        try:
+            info = self.clones.index_information().get("owner_id_1")
+            if info and info.get("unique"):
+                self.clones.drop_index("owner_id_1")
+        except Exception as e:
+            print(f"[WARN] clones owner_id index migrate failed: {e}")
+        self.clones.create_index("owner_id")
         self.clone_msgs.create_index(
             [("bot_id", ASCENDING), ("owner_msg_id", ASCENDING)], unique=True
         )
@@ -781,7 +790,7 @@ class Database:
 
     # ========== CONTACT-BOT CLONES ==========
     def add_clone(self, bot_id, owner_id, username, token_enc):
-        """Raises DuplicateKeyError if the bot or the owner already has a clone."""
+        """Raises DuplicateKeyError if the bot is already registered."""
         self.clones.insert_one({
             "bot_id": bot_id, "owner_id": owner_id, "username": username,
             "token_enc": token_enc, "created_at": datetime.utcnow(),
@@ -792,6 +801,9 @@ class Database:
 
     def get_clone_by_owner(self, owner_id):
         return self._clean(self.clones.find_one({"owner_id": owner_id}))
+
+    def list_clones_by_owner(self, owner_id):
+        return self._clean_many(self.clones.find({"owner_id": owner_id}).sort("created_at", ASCENDING))
 
     def list_clones(self):
         return self._clean_many(self.clones.find({}).sort("created_at", ASCENDING))
