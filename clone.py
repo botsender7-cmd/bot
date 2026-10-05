@@ -245,7 +245,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
 
     elif cmd == "list":
         if is_owner(user.id):
+            context.user_data["state"] = None
             await _show_list(query)
+
+    elif cmd == "add":
+        if not is_owner(user.id):
+            return
+        if not enabled():
+            await query.edit_message_text(
+                "🤖 Clone feature chalu nahi hai (ENCRYPTION_KEY set nahi hai).",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 Back", callback_data="cl_list")]]),
+            )
+            return
+        if db.get_clone_by_owner(user.id):
+            await query.edit_message_text(
+                "ℹ️ Aapka apna clone pehle se bana hua hai (ek user = ek clone). "
+                "Naya add karne ke liye pehle use list se hata do.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 Back", callback_data="cl_list")]]),
+            )
+            return
+        if db.count_clones() >= Config.MAX_CLONES:
+            await query.edit_message_text(
+                f"❌ Limit poori ho gayi ({Config.MAX_CLONES}). MAX_CLONES env badhao.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 Back", callback_data="cl_list")]]),
+            )
+            return
+        context.user_data["state"] = STATE_TOKEN
+        await query.edit_message_text(
+            "➕ <b>Clone add karo</b>\n\n"
+            "@BotFather se naye bot ka token lo aur <b>yahan bhejo</b>. "
+            "Bot aapka (owner ka) contact bot ban jaayega. "
+            "Phir us bot me ek baar <b>Start</b> dabana mat bhoolna.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="cl_list")]]),
+            parse_mode="HTML",
+        )
 
     elif cmd == "kill":
         if not is_owner(user.id):
@@ -270,15 +307,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
 
 async def _show_list(query):
     rows = db.list_clones()
+    add_btn = [InlineKeyboardButton("➕ Clone Add Karo", callback_data="cl_add")]
     if not rows:
         await query.edit_message_text(
             "🤖 Abhi koi clone nahi hai.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]
+                [add_btn, [InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]
             ),
         )
         return
-    lines, buttons = [f"🤖 <b>Clones ({len(rows)}/{Config.MAX_CLONES})</b>\n"], []
+    lines, buttons = [f"🤖 <b>Clones ({len(rows)}/{Config.MAX_CLONES})</b>\n"], [add_btn]
     for r in rows:
         state = "✅" if r["bot_id"] in running else "❌"
         lines.append(f"{state} @{html.escape(r['username'] or '?')} - owner <code>{r['owner_id']}</code>")
