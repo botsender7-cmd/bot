@@ -178,12 +178,24 @@ def get_media_label(media_type):
         return ("📝", ".txt")
     return MEDIA_FORMAT_INFO.get(media_type, ("📎", f".{media_type}"))
 
+def format_schedule_time(value):
+    """schedule_time is stored as naive UTC datetime (Mongo returns datetime,
+    not str). Show it in IST, which is what the user typed it in."""
+    if not value:
+        return "N/A"
+    from datetime import datetime, timedelta
+    try:
+        dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+        return (dt + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M") + " IST"
+    except Exception:
+        return str(value)[:16]
+
 def get_scheduled_list_keyboard(messages):
     buttons = []
     for msg in messages:
         status_emoji = "⏳" if msg["status"] == "pending" else "✅" if msg["status"] == "sent" else "❌"
         icon, fmt = get_media_label(msg.get("media_type"))
-        time_str = msg["schedule_time"][:16] if msg["schedule_time"] else "N/A"
+        time_str = format_schedule_time(msg.get("schedule_time"))
         buttons.append([
             InlineKeyboardButton(
                 f"{status_emoji} {icon} {fmt} | ID:{msg['id']} | {time_str}",

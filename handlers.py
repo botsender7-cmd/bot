@@ -8,7 +8,7 @@ from config import Config
 from database import db
 import api_client
 from keyboards import *
-from scheduler import scheduler
+import scheduler as scheduler_module
 import pshare
 import contact
 import clone
@@ -770,7 +770,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from keyboards import get_media_label
             icon, fmt = get_media_label(msg.get("media_type"))
             status = "⏳ Pending" if msg["status"] == "pending" else "✅ Sent" if msg["status"] == "sent" else f"❌ {msg['status']}"
-            time_str = msg["schedule_time"][:16] if msg["schedule_time"] else "N/A"
+            time_str = format_schedule_time(msg.get("schedule_time"))
             target = str(msg.get('target_type', '?')) + ' -> ' + str(msg.get('target_id', '?'))
             preview = msg.get("media_caption") or msg.get("message_text") or "—"
             if len(preview) > 80:
@@ -791,8 +791,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("del_sched_"):
         msg_id = int(data.replace("del_sched_", ""))
         db.delete_scheduled_message(msg_id)
-        if scheduler:
-            scheduler.remove_scheduled_job(msg_id)
+        if scheduler_module.scheduler:
+            scheduler_module.scheduler.remove_scheduled_job(msg_id)
         await query.edit_message_text("**Schedule delete ho gaya!**", reply_markup=get_main_menu(user_id), parse_mode="Markdown")
 
     # ===== OWNER PANEL =====
@@ -1301,8 +1301,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_user = report.get("reported_user_id")
         if sched_id:
             db.delete_scheduled_message(sched_id)
-            if scheduler:
-                scheduler.remove_scheduled_job(sched_id)
+            if scheduler_module.scheduler:
+                scheduler_module.scheduler.remove_scheduled_job(sched_id)
             media_entry = db.get_media_log_by_schedule_id(sched_id)
             if media_entry:
                 db.mark_media_log_status(media_entry["id"], "removed")
@@ -1452,8 +1452,8 @@ async def _finalize_schedule(update, context, user, schedule_time_utc, ist_displ
         media_type=media_type, media_file_id=media_file_id, media_caption=media_caption
     )
 
-    if msg_data and scheduler:
-        scheduler.schedule_message(
+    if msg_data and scheduler_module.scheduler:
+        scheduler_module.scheduler.schedule_message(
             msg_data["id"], target_type, target_id, message_text, schedule_time_utc,
             media_type=media_type, media_file_id=media_file_id, media_caption=media_caption
         )
