@@ -443,3 +443,12 @@ def get_contact_block_keyboard(user_id, blocked):
         btn = InlineKeyboardButton("🚫 Block user", callback_data=f"ct_blk_{user_id}")
     return InlineKeyboardMarkup([[btn]])
 
+
+
+def get_schedule_more_keyboard(can_add=True):
+    buttons = []
+    if can_add:
+        buttons.append([InlineKeyboardButton("➕ Aur item add karo", callback_data="sched_add_more")])
+    buttons.append([InlineKeyboardButton("✅ Done - Date/Time set karo", callback_data="sched_done")])
+    buttons.append([InlineKeyboardButton("↩️ Last item hatao", callback_data="sched_undo")])
+    return InlineKeyboardMarkup(buttons)

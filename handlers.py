@@ -552,6 +552,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== SCHEDULE MESSAGE =====
     elif data == "schedule_msg":
         context.user_data["active_feature"] = "schedule"
+        context.user_data.pop("sched_batch", None)
+        for _k in _ITEM_KEYS:
+            context.user_data.pop(_k, None)
 
         await query.edit_message_text("**Schedule Message**\n\nKahan bhejna hai?", reply_markup=get_schedule_type_keyboard(), parse_mode="Markdown")
 
@@ -568,6 +571,38 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- User: `@username` ya `123456789`",
             parse_mode="Markdown"
         )
+
+    # ===== MULTI-ITEM SCHEDULING: add more / undo / done =====
+    elif data == "sched_add_more":
+        if not context.user_data.get("sched_target_id"):
+            await query.edit_message_text("**Session expired. /menu se dobara try karein.**", parse_mode="Markdown")
+            return
+        context.user_data["state"] = None
+        await query.edit_message_text("**Agla item - type choose karein:**", reply_markup=get_media_type_keyboard(), parse_mode="Markdown")
+
+    elif data == "sched_undo":
+        batch = context.user_data.get("sched_batch") or []
+        if batch:
+            batch.pop()
+        if batch:
+            await query.edit_message_text(
+                _batch_text(batch, "↩️ Last item hata diya."),
+                reply_markup=get_schedule_more_keyboard(can_add=len(batch) < MAX_BATCH_ITEMS),
+                parse_mode="Markdown")
+        else:
+            context.user_data["state"] = None
+            await query.edit_message_text("**Queue khali hai. Item type choose karein:**", reply_markup=get_media_type_keyboard(), parse_mode="Markdown")
+
+    elif data == "sched_done":
+        batch = context.user_data.get("sched_batch") or []
+        if not batch:
+            await query.edit_message_text("**Session expired. /menu se dobara try karein.**", parse_mode="Markdown")
+            return
+        context.user_data["state"] = SCHEDULE_DATE
+        await query.edit_message_text(
+            f"\U0001f4c5 **{len(batch)} item ready.**\n\n**Date bhejein:**\n\nFormat: `DD-MM-YYYY`\nExample: `25-12-2026`\n\n"
+            f"Sab items isi time pe jayenge, {BATCH_GAP_SECONDS} sec ke gap se (order same rahega).",
+            parse_mode="Markdown")
 
     # ===== MEDIA TYPE SELECTION =====
     elif data.startswith("media_"):
@@ -1421,14 +1456,58 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mod_lookup_mode"] = "full"
 
 
+MAX_BATCH_ITEMS = 10          # per-run cap (Telegram flood limits: ~20 msgs/min per group)
+BATCH_GAP_SECONDS = 3         # spacing between items so order is preserved
+_ITEM_KEYS = ("sched_media_type", "sched_media_file_id", "sched_media_caption",
+              "sched_message_text", "poll_question", "pending_media_type")
+_MEDIA_NAMES = {
+    "photo": "\U0001f4f7 Photo", "video": "\U0001f3ac Video",
+    "document": "\U0001f4c4 Document", "audio": "\U0001f3b5 Audio",
+    "voice": "\U0001f3a4 Voice", "video_note": "\U0001f39e Video Note",
+    "animation": "\U0001f3ad Animation/GIF", "sticker": "\U0001f3f7 Sticker",
+    "location": "\U0001f4cd Location", "poll": "\U0001f4ca Poll",
+    "contact": "\U0001f464 Contact",
+}
+
+
+def _batch_text(batch, header):
+    lines = [f"{i}. {_MEDIA_NAMES.get(it['media_type'], chr(0x1F4DD) + ' Text')}" for i, it in enumerate(batch, 1)]
+    footer = ("\n\nLimit poori ho gayi - ab Done dabayein." if len(batch) >= MAX_BATCH_ITEMS
+              else "\n\nAur add karna hai ya Done?")
+    return f"**{header}**\n\n" + "\n".join(lines) + footer
+
+
+async def _item_collected(update, context):
+    """Called once an item's content is fully collected. Pushes it to the batch
+    queue and asks: add another item, or finish and set date/time."""
+    ud = context.user_data
+    batch = ud.setdefault("sched_batch", [])
+    batch.append({
+        "media_type": ud.get("sched_media_type"),
+        "media_file_id": ud.get("sched_media_file_id"),
+        "media_caption": ud.get("sched_media_caption"),
+        "message_text": ud.get("sched_message_text", ""),
+    })
+    # Clear per-item keys so the next item can't inherit this one's text/caption
+    for k in _ITEM_KEYS:
+        ud.pop(k, None)
+    ud["state"] = None
+    await update.message.reply_text(
+        _batch_text(batch, f"\u2705 Item #{len(batch)} add ho gaya."),
+        reply_markup=get_schedule_more_keyboard(can_add=len(batch) < MAX_BATCH_ITEMS),
+        parse_mode="Markdown",
+    )
+
+
 async def _finalize_schedule(update, context, user, schedule_time_utc, ist_display):
-    """Save to DB and schedule the message after time is confirmed."""
+    """Save every queued item to DB and register it with the scheduler."""
     target_type = context.user_data.get("sched_target_type")
     target_id_raw = context.user_data.get("sched_target_id")
-    media_type = context.user_data.get("sched_media_type")
-    media_file_id = context.user_data.get("sched_media_file_id")
-    media_caption = context.user_data.get("sched_media_caption")
-    message_text = context.user_data.get("sched_message_text", "")
+    batch = list(context.user_data.get("sched_batch") or [])
+    if not batch:
+        await update.message.reply_text("**Koi item nahi mila.** /menu se dobara try karein.", parse_mode="Markdown")
+        context.user_data.clear()
+        return
 
     try:
         if target_id_raw.startswith("@"):
@@ -1447,46 +1526,50 @@ async def _finalize_schedule(update, context, user, schedule_time_utc, ist_displ
         context.user_data.clear()
         return
 
-    msg_data = db.add_scheduled_message(
-        user.id, target_type, target_id, message_text, schedule_time_utc,
-        media_type=media_type, media_file_id=media_file_id, media_caption=media_caption
-    )
-
-    if msg_data and scheduler_module.scheduler:
-        scheduler_module.scheduler.schedule_message(
-            msg_data["id"], target_type, target_id, message_text, schedule_time_utc,
-            media_type=media_type, media_file_id=media_file_id, media_caption=media_caption
+    created = []
+    for i, item in enumerate(batch):
+        run_at = schedule_time_utc + timedelta(seconds=i * BATCH_GAP_SECONDS)
+        msg_data = db.add_scheduled_message(
+            user.id, target_type, target_id, item["message_text"], run_at,
+            media_type=item["media_type"], media_file_id=item["media_file_id"],
+            media_caption=item["media_caption"]
         )
+        if not msg_data:
+            continue
 
-    # ===== COPYRIGHT: LOG + NOTIFY OWNER/ADMINS =====
-    # Only for media types that can carry copyrighted long-form content.
-    if msg_data and media_type in Config.COPYRIGHT_RELEVANT_MEDIA_TYPES:
-        upload_dt = datetime.utcnow()
-        db.log_scheduled_media(
-            user_id=user.id,
-            file_id=media_file_id,
-            message_id=msg_data["id"],
-            media_type=media_type,
-            schedule_time=schedule_time_utc,
-            upload_date=upload_dt
-        )
-        await notify_owner_admins_new_media(context, user, media_type, schedule_time_utc, upload_dt)
+        if scheduler_module.scheduler:
+            scheduler_module.scheduler.schedule_message(
+                msg_data["id"], target_type, target_id, item["message_text"], run_at,
+                media_type=item["media_type"], media_file_id=item["media_file_id"],
+                media_caption=item["media_caption"]
+            )
 
-    MEDIA_NAMES = {
-        "photo": "\U0001f4f7 Photo", "video": "\U0001f3ac Video",
-        "document": "\U0001f4c4 Document", "audio": "\U0001f3b5 Audio",
-        "voice": "\U0001f3a4 Voice", "video_note": "\U0001f39e Video Note",
-        "animation": "\U0001f3ad Animation/GIF", "sticker": "\U0001f3f7 Sticker",
-        "location": "\U0001f4cd Location", "poll": "\U0001f4ca Poll",
-        "contact": "\U0001f464 Contact",
-    }
-    media_icon = MEDIA_NAMES.get(media_type, "\U0001f4dd Text")
+        # ===== COPYRIGHT: LOG + NOTIFY OWNER/ADMINS (per item) =====
+        if item["media_type"] in Config.COPYRIGHT_RELEVANT_MEDIA_TYPES:
+            upload_dt = datetime.utcnow()
+            db.log_scheduled_media(
+                user_id=user.id,
+                file_id=item["media_file_id"],
+                message_id=msg_data["id"],
+                media_type=item["media_type"],
+                schedule_time=run_at,
+                upload_date=upload_dt
+            )
+            await notify_owner_admins_new_media(context, user, item["media_type"], run_at, upload_dt)
+
+        created.append((item, msg_data["id"]))
+
+    if not created:
+        await update.message.reply_text("\u274c **Schedule save nahi ho paya.** Dobara try karein.", parse_mode="Markdown")
+        context.user_data.clear()
+        return
+
+    lines = [f"{i}. {_MEDIA_NAMES.get(it['media_type'], chr(0x1F4DD) + ' Text')} - ID `{mid}`"
+             for i, (it, mid) in enumerate(created, 1)]
     await update.message.reply_text(
-        f"\u2705 **Message Scheduled!**\n\n"
-        f"Type: {media_icon}\n"
+        f"\u2705 **{len(created)} message(s) Scheduled!**\n\n"
         f"Target: {target_type}\n"
-        f"\U0001f550 Time (IST): {ist_display}\n"
-        f"Schedule ID: `{msg_data['id'] if msg_data else 'N/A'}`",
+        f"\U0001f550 Time (IST): {ist_display}\n\n" + "\n".join(lines),
         reply_markup=get_main_menu(user.id),
         parse_mode="Markdown"
     )
@@ -1644,8 +1727,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.video_note and state == SCHEDULE_MEDIA:
         file_id = update.message.video_note.file_id
         context.user_data["sched_media_file_id"] = file_id
-        context.user_data["state"] = SCHEDULE_DATE
-        await update.message.reply_text("\U0001f4c5 **Date bhejein:**\n\nFormat: `DD-MM-YYYY`\nExample: `25-12-2026`", parse_mode="Markdown")
+        await _item_collected(update, context)
         return
 
     elif update.message.animation and state == SCHEDULE_MEDIA:
@@ -1658,8 +1740,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.sticker and state == SCHEDULE_MEDIA:
         file_id = update.message.sticker.file_id
         context.user_data["sched_media_file_id"] = file_id
-        context.user_data["state"] = SCHEDULE_DATE
-        await update.message.reply_text("\U0001f4c5 **Date bhejein:**\n\nFormat: `DD-MM-YYYY`\nExample: `25-12-2026`", parse_mode="Markdown")
+        await _item_collected(update, context)
         return
 
     # Handle text messages — if no text and state doesn't need text, ignore
@@ -1768,13 +1849,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif state == SCHEDULE_MSG:
         context.user_data["sched_message_text"] = text
-        context.user_data["state"] = SCHEDULE_DATE
-        await update.message.reply_text("\U0001f4c5 **Date bhejein:**\n\nFormat: `DD-MM-YYYY`\nExample: `25-12-2026`", parse_mode="Markdown")
+        await _item_collected(update, context)
 
     elif state == SCHEDULE_CAPTION:
         context.user_data["sched_media_caption"] = text
-        context.user_data["state"] = SCHEDULE_DATE
-        await update.message.reply_text("\U0001f4c5 **Date bhejein:**\n\nFormat: `DD-MM-YYYY`\nExample: `25-12-2026`", parse_mode="Markdown")
+        await _item_collected(update, context)
 
     elif state == SCHEDULE_LOCATION:
         try:
@@ -1783,8 +1862,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lng = float(parts[1].strip())
             context.user_data["sched_media_type"] = "location"
             context.user_data["sched_media_file_id"] = f"{lat},{lng}"
-            context.user_data["state"] = SCHEDULE_DATE
-            await update.message.reply_text("\U0001f4c5 **Date bhejein:**\n\nFormat: `DD-MM-YYYY`\nExample: `25-12-2026`", parse_mode="Markdown")
+            await _item_collected(update, context)
         except:
             await update.message.reply_text("**Galat format!** Use: `latitude,longitude`\nExample: `28.6139,77.2090`", parse_mode="Markdown")
 
@@ -1808,8 +1886,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             context.user_data["sched_media_type"] = "poll"
             context.user_data["sched_message_text"] = json.dumps(poll_data)
-            context.user_data["state"] = SCHEDULE_DATE
-            await update.message.reply_text("\U0001f4c5 **Date bhejein:**\n\nFormat: `DD-MM-YYYY`\nExample: `25-12-2026`", parse_mode="Markdown")
+            await _item_collected(update, context)
         except:
             await update.message.reply_text("**Galat format!** Use comma separated options.", parse_mode="Markdown")
 
@@ -1821,8 +1898,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_name = parts[2].strip() if len(parts) > 2 else ""
             context.user_data["sched_media_type"] = "contact"
             context.user_data["sched_media_file_id"] = f"{phone}|{first_name}|{last_name}"
-            context.user_data["state"] = SCHEDULE_DATE
-            await update.message.reply_text("\U0001f4c5 **Date bhejein:**\n\nFormat: `DD-MM-YYYY`\nExample: `25-12-2026`", parse_mode="Markdown")
+            await _item_collected(update, context)
         except:
             await update.message.reply_text("**Galat format!** Use: `phone|first_name|last_name`", parse_mode="Markdown")
 
@@ -2243,11 +2319,7 @@ async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state")
     if state == SCHEDULE_CAPTION:
         context.user_data["sched_media_caption"] = None
-        context.user_data["state"] = SCHEDULE_DATE
-        await update.message.reply_text(
-            "\U0001f4c5 **Date bhejein:**\n\nFormat: `DD-MM-YYYY`\nExample: `25-12-2026`",
-            parse_mode="Markdown"
-        )
+        await _item_collected(update, context)
     else:
         await update.message.reply_text("❌ Abhi /skip use nahi ho sakta.")
 
