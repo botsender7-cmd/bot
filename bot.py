@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()  # must run before `config` is imported (Config reads env at import time)
 
+import asyncio
 import logging
 import os
 from telegram import Update, BotCommand, BotCommandScopeAllChatAdministrators
@@ -26,6 +27,17 @@ logger = logging.getLogger(__name__)
 # (this bot's and every clone's). Keep those lines out of the logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+async def _keepalive(url, every):
+    import httpx
+    while True:
+        await asyncio.sleep(every)
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                await c.get(url)
+        except Exception as e:
+            logger.warning(f"[KEEPALIVE] ping failed: {e}")
+
+
 async def post_init(application):
     logger.info("SETTING COMMANDS...")
 
@@ -50,6 +62,16 @@ async def post_init(application):
 
     cmds = await application.bot.get_my_commands()
     logger.info(f"CURRENT COMMANDS: {cmds}")
+
+    # Keep-alive: Render's free tier sleeps after ~15 min without INBOUND http, and a
+    # sleeping process cannot send scheduled messages. Pinging our own public URL
+    # counts as inbound traffic. (An external pinger such as UptimeRobot is still
+    # the more reliable option - this just covers the gap.) KEEPALIVE_INTERVAL=0 disables.
+    ka_url = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    ka_every = int(os.getenv("KEEPALIVE_INTERVAL", "600"))
+    if ka_url and ka_every > 0:
+        application.bot_data["keepalive_task"] = asyncio.ensure_future(_keepalive(ka_url, ka_every))
+        logger.info(f"[KEEPALIVE] pinging {ka_url} every {ka_every}s")
 
     # Initialize scheduler HERE (inside async context = PTB's event loop).
     # This ensures APScheduler uses the correct running loop — not a stale

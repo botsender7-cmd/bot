@@ -3,6 +3,7 @@ from apscheduler.triggers.date import DateTrigger
 from datetime import datetime, timedelta, timezone
 from database import db
 from telegram import Bot
+from telegram.error import BadRequest
 import asyncio
 import logging
 
@@ -14,6 +15,10 @@ logger = logging.getLogger(__name__)
 # within half a minute of its scheduled time.
 DB_POLL_INTERVAL = 30
 
+# If APScheduler still "owns" a message this many seconds after it was due,
+# the job clearly never ran (misfire / lost job) - the poll loop takes over.
+STUCK_GRACE_SECONDS = 60
+
 
 class MessageScheduler:
     def __init__(self, bot: Bot):
@@ -22,6 +27,9 @@ class MessageScheduler:
         # Track which msg_ids are currently "in-flight" so the DB poll
         # loop never double-fires a message that APScheduler already sent.
         self._in_flight: set = set()
+        # msg_ids whose send is happening RIGHT NOW (guards against the poll loop
+        # double-firing a message whose send is slow, e.g. a large upload).
+        self._sending: set = set()
 
     def _get_scheduler(self):
         """Return the scheduler, starting it inside the running loop if needed."""
@@ -39,14 +47,20 @@ class MessageScheduler:
     def schedule_message(self, msg_id, target_type, target_id, message_text, schedule_time,
                          media_type=None, media_file_id=None, media_caption=None,
                          reply_markup=None):
-        trigger = DateTrigger(run_date=schedule_time)
+        # schedule_time is naive UTC. Make it explicit so we never depend on the
+        # host's local timezone (a naive run_date is otherwise localized with it).
+        run_date = schedule_time.replace(tzinfo=timezone.utc) if schedule_time.tzinfo is None else schedule_time
+        trigger = DateTrigger(run_date=run_date, timezone=timezone.utc)
         self._get_scheduler().add_job(
             self._send_scheduled_message,
             trigger=trigger,
             args=[msg_id, target_type, target_id, message_text, media_type, media_file_id,
                   media_caption, reply_markup],
             id=str(msg_id),
-            replace_existing=True
+            replace_existing=True,
+            # Default is 1 second: if the event loop is busy for >1s the job is
+            # silently dropped as "misfired". Allow up to 1h of lateness instead.
+            misfire_grace_time=3600,
         )
         # Register in-flight so DB poll loop won't duplicate it
         self._in_flight.add(msg_id)
@@ -65,13 +79,22 @@ class MessageScheduler:
     async def _send_scheduled_message(self, msg_id, target_type, target_id, message_text,
                                        media_type, media_file_id, media_caption, reply_markup):
         # Guard: if somehow called twice, bail out early
-        if msg_id not in self._in_flight:
-            logger.warning(f"[SCHEDULER] msg_id={msg_id} not in _in_flight — skipping duplicate fire")
+        if msg_id in self._sending or msg_id not in self._in_flight:
+            logger.warning(f"[SCHEDULER] msg_id={msg_id} already sending/handled — skipping duplicate fire")
             return
 
-        # Mark as no longer in-flight BEFORE sending, so a failure
-        # doesn't leave it stuck in the set forever.
+        # Mark as sending BEFORE the first await, so neither APScheduler nor the
+        # poll loop can start a second send while this one is in progress.
+        self._sending.add(msg_id)
         self._in_flight.discard(msg_id)
+        try:
+            await self._do_send(msg_id, target_type, target_id, message_text,
+                                media_type, media_file_id, media_caption, reply_markup)
+        finally:
+            self._sending.discard(msg_id)
+
+    async def _do_send(self, msg_id, target_type, target_id, message_text,
+                       media_type, media_file_id, media_caption, reply_markup):
 
         # Ensure target_id is int (Supabase may return string)
         try:
@@ -130,8 +153,15 @@ class MessageScheduler:
                                                  first_name=first_name, last_name=last_name,
                                                  reply_markup=reply_markup)
             else:
-                await self.bot.send_message(chat_id=target_id, text=message_text,
-                                             reply_markup=reply_markup, parse_mode="HTML")
+                try:
+                    await self.bot.send_message(chat_id=target_id, text=message_text,
+                                                 reply_markup=reply_markup, parse_mode="HTML")
+                except BadRequest as be:
+                    if "parse entities" not in str(be).lower():
+                        raise
+                    # Text has a stray < or & - send it as plain text instead of failing.
+                    await self.bot.send_message(chat_id=target_id, text=message_text,
+                                                 reply_markup=reply_markup)
 
             db.update_message_status(msg_id, "sent")
             logger.info(f"[SCHEDULER] msg_id={msg_id} sent successfully to {target_id}")
@@ -140,6 +170,20 @@ class MessageScheduler:
             error_msg = f"failed: {str(e)}"
             db.update_message_status(msg_id, error_msg)
             logger.error(f"[SCHEDULER ERROR] msg_id={msg_id}: {e}", exc_info=True)
+            await self._notify_failure(msg_id, e)
+
+    async def _notify_failure(self, msg_id, err):
+        """Tell the user who scheduled it WHY it failed (previously silent)."""
+        try:
+            row = db.get_scheduled_message_by_id(msg_id)
+            if not row:
+                return
+            await self.bot.send_message(
+                chat_id=row["user_id"],
+                text=f"❌ Scheduled message (ID {msg_id}) send nahi ho paya.\n\nReason: {friendly_error(err)}",
+            )
+        except Exception as ne:
+            logger.warning(f"[SCHEDULER] Could not notify user about failed msg_id={msg_id}: {ne}")
 
     def remove_scheduled_job(self, msg_id):
         self._in_flight.discard(msg_id)
@@ -179,8 +223,8 @@ class MessageScheduler:
         for msg in pending:
             msg_id = msg["id"]
 
-            # Already being handled by APScheduler
-            if msg_id in self._in_flight:
+            # Send already running right now
+            if msg_id in self._sending:
                 continue
 
             try:
@@ -189,8 +233,16 @@ class MessageScheduler:
                 logger.error(f"[DB POLL] Bad schedule_time for msg_id={msg_id}: {e}")
                 continue
 
+            # APScheduler owns it - leave it alone unless it clearly never fired.
+            # (Before: an in-flight id was skipped forever, so a misfired/lost job
+            # stayed 'pending' and was never sent.)
+            if msg_id in self._in_flight:
+                if (now - schedule_time).total_seconds() < STUCK_GRACE_SECONDS:
+                    continue
+                logger.warning(f"[DB POLL] msg_id={msg_id} stuck in-flight past due - taking over")
+
             # Not yet due
-            if schedule_time > now:
+            elif schedule_time > now:
                 # Re-register in APScheduler in case the job was lost
                 # (e.g. container resumed from sleep)
                 if not (self._scheduler and self._scheduler.get_job(str(msg_id))):
@@ -266,6 +318,21 @@ class MessageScheduler:
 # ------------------------------------------------------------------ #
 # Module-level helpers                                                 #
 # ------------------------------------------------------------------ #
+
+def friendly_error(err):
+    """Turn Telegram errors into something the user can act on."""
+    e = str(err).lower()
+    if "chat not found" in e:
+        return "Target nahi mila - ID/username galat hai, ya bot us channel/group me add nahi hai."
+    if any(k in e for k in ("administrator rights", "not enough rights", "no rights", "not a member",
+                            "chat_admin_required", "chat_write_forbidden", "have no rights")):
+        return "Bot ko channel/group me Admin banao (Post Messages permission ON ke saath)."
+    if "blocked by the user" in e or "can't initiate" in e:
+        return "User ne bot ko block kiya hai ya bot ko /start nahi kiya."
+    if "file" in e and ("wrong" in e or "invalid" in e):
+        return "File ID invalid hai - file dobara upload karke schedule karein."
+    return str(err)[:200]
+
 
 def _parse_reply_markup(raw_markup):
     """Parse reply_markup_json from DB into an InlineKeyboardMarkup, or None."""

@@ -1565,6 +1565,42 @@ async def _item_collected(update, context):
     )
 
 
+async def _bot_can_post(bot, chat_id, target_type):
+    """Pre-flight: can the bot actually post in the target? Returns (ok, reason).
+    Only blocks on clear 'no' answers; if the check itself fails for an unclear
+    reason (network etc.) it lets scheduling proceed."""
+    if target_type == "user":
+        return True, None
+    try:
+        chat = await bot.get_chat(chat_id)
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+    except Exception as e:
+        err = str(e).lower()
+        if "chat not found" in err:
+            return False, ("Chat nahi mila. ID galat hai, ya bot us channel/group me add nahi hai. "
+                           "Pehle bot ko add karke Admin banao.")
+        if "not a member" in err or "kicked" in err:
+            return False, "Bot us channel/group ka member nahi hai. Pehle add karke Admin banao."
+        return True, None
+
+    status = member.status
+    if status in ("left", "kicked"):
+        return False, "Bot us channel/group me nahi hai. Pehle add karke Admin banao."
+    if status == "creator":
+        return True, None
+    if status == "administrator":
+        if chat.type == "channel" and getattr(member, "can_post_messages", True) is False:
+            return False, "Bot Admin hai lekin Post Messages permission OFF hai. Permission ON karein."
+        return True, None
+    # plain member / restricted
+    if chat.type == "channel":
+        return False, "Channel me post karne ke liye bot ko Admin banana zaroori hai (Post Messages permission ke saath)."
+    if status == "restricted" and getattr(member, "can_send_messages", True) is False:
+        return False, "Bot is group me restricted hai - message nahi bhej sakta. Admin banao ya restriction hatao."
+    return True, None
+
+
 async def _finalize_schedule(update, context, user, schedule_time_utc, ist_display):
     """Save every queued item to DB and register it with the scheduler."""
     target_type = context.user_data.get("sched_target_type")
@@ -1590,6 +1626,16 @@ async def _finalize_schedule(update, context, user, schedule_time_utc, ist_displ
     if schedule_time_utc <= now_utc:
         await update.message.reply_text("\u274c **Past time nahi dal sakte!** Dobara /start karein.", parse_mode="Markdown")
         context.user_data.clear()
+        return
+
+    # Pre-flight permission check: fail NOW with a clear reason instead of
+    # saving a schedule that can only fail silently at send time.
+    # State is left untouched, so after fixing it the user just resends the time.
+    ok, reason = await _bot_can_post(context.bot, target_id, target_type)
+    if not ok:
+        await update.message.reply_text(
+            f"❌ Schedule save nahi hua.\n\n{reason}\n\n"
+            f"Fix karne ke baad bas time dobara bhejein - items queue me safe hain.")
         return
 
     created = []
