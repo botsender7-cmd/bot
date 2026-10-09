@@ -616,8 +616,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["sched_media_type"] = media_type if media_type != "text" else None
 
         if media_type == "text":
-            context.user_data["state"] = SCHEDULE_MSG
-            await query.edit_message_text("**Message text bhejein:**", parse_mode="Markdown")
+            await _enter_bulk(query, context, "text")
 
         elif media_type == "location":
             context.user_data["state"] = SCHEDULE_LOCATION
@@ -653,13 +652,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         else:
             # Sticker — not copyright-gated (sticker-pack IP is a separate question)
-            media_names = {"sticker": "Sticker"}
-            context.user_data["state"] = SCHEDULE_MEDIA
-            await query.edit_message_text(
-                f"{media_names.get(media_type, media_type)} **bhejein** (forward ya upload karein):\n\n"
-                f"Note: Bot ko us channel/group mein admin hona chahiye agar wahan bhejna hai.",
-                parse_mode="Markdown"
-            )
+            await _enter_bulk(query, context, media_type)
 
     # ===== COPYRIGHT WARNING ACKNOWLEDGMENT =====
     elif data == "copyright_ack":
@@ -669,17 +662,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         db.set_copyright_warning_acknowledged(user_id)
         context.user_data["sched_media_type"] = media_type
-        media_names = {
-            "photo": "Photo", "video": "Video", "document": "Document",
-            "audio": "Audio", "voice": "Voice", "video_note": "Video Note",
-            "animation": "Animation"
-        }
-        context.user_data["state"] = SCHEDULE_MEDIA
-        await query.edit_message_text(
-            f"{media_names.get(media_type, media_type)} **bhejein** (forward ya upload karein):\n\n"
-            f"Note: Bot ko us channel/group mein admin hona chahiye agar wahan bhejna hai.",
-            parse_mode="Markdown"
-        )
+        await _enter_bulk(query, context, media_type)
 
 
     # ===== QR CODE =====
@@ -1458,8 +1441,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 MAX_BATCH_ITEMS = 10          # per-run cap (Telegram flood limits: ~20 msgs/min per group)
 BATCH_GAP_SECONDS = 3         # spacing between items so order is preserved
+SCHEDULE_BULK = "sched_bulk"   # state: user is sending many items of one type
 _ITEM_KEYS = ("sched_media_type", "sched_media_file_id", "sched_media_caption",
-              "sched_message_text", "poll_question", "pending_media_type")
+              "sched_message_text", "poll_question", "pending_media_type",
+              "sched_bulk_type", "bulk_status_msg_id", "bulk_limit_warned")
+_BULK_LABEL = {
+    "text": "Text message", "photo": "Photo", "video": "Video", "document": "Document",
+    "audio": "Audio", "voice": "Voice", "video_note": "Video Note",
+    "animation": "Animation/GIF", "sticker": "Sticker",
+}
 _MEDIA_NAMES = {
     "photo": "\U0001f4f7 Photo", "video": "\U0001f3ac Video",
     "document": "\U0001f4c4 Document", "audio": "\U0001f3b5 Audio",
@@ -1470,11 +1460,87 @@ _MEDIA_NAMES = {
 }
 
 
-def _batch_text(batch, header):
+def _batch_text(batch, header, more_hint=None):
     lines = [f"{i}. {_MEDIA_NAMES.get(it['media_type'], chr(0x1F4DD) + ' Text')}" for i, it in enumerate(batch, 1)]
-    footer = ("\n\nLimit poori ho gayi - ab Done dabayein." if len(batch) >= MAX_BATCH_ITEMS
-              else "\n\nAur add karna hai ya Done?")
+    if len(batch) >= MAX_BATCH_ITEMS:
+        footer = "\n\nLimit poori ho gayi - ab Done dabayein."
+    else:
+        footer = "\n\n" + (more_hint or "Aur add karna hai ya Done?")
     return f"**{header}**\n\n" + "\n".join(lines) + footer
+
+
+async def _enter_bulk(query, context, media_type):
+    """Bulk mode: every message the user sends (of this one type) becomes its own item."""
+    ud = context.user_data
+    ud["sched_bulk_type"] = media_type
+    ud.pop("bulk_status_msg_id", None)
+    ud.pop("bulk_limit_warned", None)
+    ud["state"] = SCHEDULE_BULK
+    label = _BULK_LABEL.get(media_type, media_type)
+    how = ("Har message alag item banega." if media_type == "text" else
+           "Ek saath kitne bhi bhejo (album bhi chalega). Caption chahiye to file ke saath hi likh ke bhejo.")
+    have = len(ud.get("sched_batch") or [])
+    await query.edit_message_text(
+        f"**{label} bhejein**\n\n{how}\n"
+        f"Max {MAX_BATCH_ITEMS} items total (abhi queue me: {have}).\n"
+        f"Khatam hone par ✅ Done dabayein.\n\n"
+        f"Note: Bot ko us channel/group mein admin hona chahiye agar wahan bhejna hai.",
+        parse_mode="Markdown")
+
+
+def _bulk_file_id(msg, media_type):
+    obj = getattr(msg, media_type, None)
+    if not obj:
+        return None
+    return obj[-1].file_id if media_type == "photo" else obj.file_id
+
+
+async def _bulk_collect(update, context):
+    """Handles one incoming message while in bulk mode. Always consumes the message."""
+    ud = context.user_data
+    msg = update.message
+    t = ud.get("sched_bulk_type")
+    if not t:
+        ud["state"] = None
+        return False
+    label = _BULK_LABEL.get(t, t)
+    batch = ud.setdefault("sched_batch", [])
+    kb = lambda: get_schedule_more_keyboard(can_add=len(batch) < MAX_BATCH_ITEMS)
+
+    if t == "text":
+        item = ({"media_type": None, "media_file_id": None, "media_caption": None,
+                 "message_text": msg.text} if msg.text else None)
+    else:
+        fid = _bulk_file_id(msg, t)
+        item = ({"media_type": t, "media_file_id": fid, "media_caption": getattr(msg, "caption", None) or None,
+                 "message_text": ""} if fid else None)
+    if item is None:
+        await msg.reply_text(f"❌ Abhi sirf {label} bhejein (ya Done dabayein).")
+        return True
+
+    if len(batch) >= MAX_BATCH_ITEMS:
+        if not ud.get("bulk_limit_warned"):
+            ud["bulk_limit_warned"] = True
+            await msg.reply_text(f"⚠️ Limit ({MAX_BATCH_ITEMS}) poori ho gayi. Extra items ignore ho rahe hain - Done dabayein.",
+                                 reply_markup=kb())
+        return True
+
+    batch.append(item)
+    text = _batch_text(batch, f"📥 {len(batch)} item add hue.",
+                       more_hint=f"Aur {label} bhejte raho, ya Done dabayein. Dusre type ke liye ➕ dabayein.")
+    mid = ud.get("bulk_status_msg_id")
+    if mid:
+        # One status message, edited in place (no spam on albums). Edit can fail on
+        # Telegram rate limits - that's cosmetic only; the Done screen shows the real count.
+        try:
+            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=mid, text=text,
+                                                reply_markup=kb(), parse_mode="Markdown")
+        except Exception:
+            pass
+    else:
+        sent = await msg.reply_text(text, reply_markup=kb(), parse_mode="Markdown")
+        ud["bulk_status_msg_id"] = sent.message_id
+    return True
 
 
 async def _item_collected(update, context):
@@ -1687,6 +1753,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await audio_finalize(update, context, text)
         return
+
+    # ----- Schedule bulk mode: many items of one type -----
+    if state == SCHEDULE_BULK:
+        if await _bulk_collect(update, context):
+            return
 
     # Handle media messages (photo, video, document, etc.)
     if update.message.photo and state == SCHEDULE_MEDIA:
