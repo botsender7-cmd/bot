@@ -137,3 +137,8 @@ class Config:
     CLONE_AUTODEL_MAX_SECONDS = 48 * 60 * 60
     CLONE_AUTODEL_SWEEP_SECONDS = 10
     CLONE_SENT_TTL_HOURS = 47
+
+    # ===== Clone moderators =====
+    # Owner of a clone adds moderators with /addmod inside the clone bot. Moderators
+    # receive the same user messages, can reply and /ban /unban. Cap per clone:
+    MAX_CLONE_MODS = int(os.getenv("MAX_CLONE_MODS", "10"))

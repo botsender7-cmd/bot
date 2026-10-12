@@ -13,6 +13,15 @@ How it runs
   * One clone per normal user (at most Config.MAX_CLONES in total); the bot owner may add unlimited clones from Owner Panel.
   * The bot owner (Config.OWNER_ID) can list / remove clones: Owner Panel -> 🤖 Contact Clones.
 
+Moderators (per clone, managed by the clone's owner inside the clone bot)
+  * /addmod (reply to a user's message, or /addmod <user_id>), /delmod <id>, /mods.
+  * A moderator gets a copy of every incoming user message (header + message, like the owner),
+    can reply to it, and can /ban /unban or tap the Block button. Max Config.MAX_CLONE_MODS.
+  * Owner-only: /addmod /delmod /mods /autodelete /del (+ "Dono taraf delete" button).
+  * Adding works only if the person can be DM'd (has pressed Start in the clone bot).
+  * Reply mappings are stored per (bot, chat, message id), because each staff chat has its
+    own copy and Telegram message ids are only unique inside one chat.
+
 Auto-delete (per clone, set by the clone's owner inside the clone bot)
   * /autodelete          -> buttons (30s ... 48h / Off), or /autodelete 45m, 2h, 90s, off
   * Once ON, every message the clone handles is deleted after that time, in BOTH chats
@@ -483,7 +492,7 @@ async def _sweep_once():
         except TelegramError:
             pass
         if d.get("owner_chat"):
-            db.delete_clone_map(d["bot_id"], d["message_id"])
+            db.delete_clone_map(d["bot_id"], d["chat_id"], d["message_id"])
         db.drop_clone_autodel(d["_id"])
 
 
@@ -604,8 +613,14 @@ async def c_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Jawab dene ke liye us message par reply karo. "
             "/ban aur /unban bhi user ke message par reply karke chalte hain.\n\n"
             "⏱ /autodelete - messages ka auto-delete timer\n"
-            "🗑 /del - bheje hue jawab par reply karo, user ki chat se bhi delete ho jaayega"
+            "🗑 /del - bheje hue jawab par reply karo, user ki chat se bhi delete ho jaayega\n"
+            "🛡 /addmod - moderator banao (user ke message par reply karo ya /addmod <user_id>)\n"
+            "🛡 /delmod - moderator hatao\n"
+            "📋 /mods - moderators ki list"
         )
+        return
+    if update.effective_user.id in context.application.bot_data["mods"]:
+        await update.effective_message.reply_text(_MOD_WELCOME)
         return
     secs = context.application.bot_data.get("autodel", 0)
     note = (f"\n\n⏱ Is chat ke messages {fmt_duration(secs)} baad apne aap delete ho jaate hain."
@@ -628,34 +643,44 @@ async def c_from_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text("⏳ Thoda dheere, bahut jaldi jaldi message aa rahe hain.")
         return
 
-    try:
-        header = await context.bot.send_message(
-            owner_id, contact._header(user), parse_mode="HTML",
-            reply_markup=_block_kb(user.id, False),
-        )
-        copied = await context.bot.copy_message(
-            chat_id=owner_id, from_chat_id=msg.chat_id, message_id=msg.message_id,
-            reply_to_message_id=header.message_id,
-        )
-    except TelegramError as exc:
-        logger.error("Clone %s: owner ko message nahi gaya: %s", bot_id, type(exc).__name__)
+    # Owner AND every moderator get their own copy; the message counts as delivered
+    # as soon as one of them got it (a moderator who never pressed Start is skipped).
+    delivered = 0
+    for rid in [owner_id, *context.application.bot_data["mods"]]:
+        try:
+            header = await context.bot.send_message(
+                rid, contact._header(user), parse_mode="HTML",
+                reply_markup=_block_kb(user.id, False),
+            )
+            copied = await context.bot.copy_message(
+                chat_id=rid, from_chat_id=msg.chat_id, message_id=msg.message_id,
+                reply_to_message_id=header.message_id,
+            )
+        except TelegramError as exc:
+            logger.error("Clone %s: staff %s ko message nahi gaya: %s",
+                         bot_id, rid, type(exc).__name__)
+            continue
+        db.save_clone_map(bot_id, rid, header.message_id, user.id)
+        db.save_clone_map(bot_id, rid, copied.message_id, user.id)
+        # auto-delete (no-op when OFF): staff side (+ map cleanup)
+        _track(context, rid, header.message_id, owner_chat=True)
+        _track(context, rid, copied.message_id, owner_chat=True)
+        delivered += 1
+
+    if not delivered:
         await msg.reply_text("Abhi message nahi pahunch paya, thodi der baad try karein.")
         return
-
-    db.save_clone_map(bot_id, header.message_id, user.id)
-    db.save_clone_map(bot_id, copied.message_id, user.id)
     ack = await msg.reply_text("✅ Aapka message owner tak pahunch gaya hai.")
-    # auto-delete (no-op when OFF): owner side (+ map cleanup) and user side
-    _track(context, owner_id, header.message_id, owner_chat=True)
-    _track(context, owner_id, copied.message_id, owner_chat=True)
-    _track(context, msg.chat_id, msg.message_id)
+    _track(context, msg.chat_id, msg.message_id)  # user side
     _track(context, msg.chat_id, ack.message_id)
 
 
 async def c_from_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply from the owner OR a moderator to a user's message."""
     msg = update.effective_message
     bot_id = context.bot.id
-    user_id = db.get_clone_user(bot_id, msg.reply_to_message.message_id)
+    is_owner_chat = update.effective_user.id == context.application.bot_data["owner_id"]
+    user_id = db.get_clone_user(bot_id, msg.chat_id, msg.reply_to_message.message_id)
     if user_id is None:
         await msg.reply_text(
             "Is message se user nahi mila. User ke bheje hue message par reply karo."
@@ -672,8 +697,11 @@ async def c_from_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.error("Clone %s: user ko reply nahi gaya: %s", bot_id, type(exc).__name__)
         await msg.reply_text("❌ Bhejne mein error aaya.")
         return
-    confirm = await msg.reply_text("✅ Bhej diya.", reply_markup=_del_kb(msg.message_id))
-    db.save_clone_sent(bot_id, msg.message_id, confirm.message_id, user_id, sent.message_id)
+    if is_owner_chat:
+        confirm = await msg.reply_text("✅ Bhej diya.", reply_markup=_del_kb(msg.message_id))
+        db.save_clone_sent(bot_id, msg.message_id, confirm.message_id, user_id, sent.message_id)
+    else:  # moderators: no "delete for both" (that is owner-only)
+        confirm = await msg.reply_text("✅ Bhej diya.")
     _track(context, user_id, sent.message_id)
     _track(context, msg.chat_id, msg.message_id)
     _track(context, msg.chat_id, confirm.message_id)
@@ -691,7 +719,7 @@ async def _ban_toggle(update, context, banned):
     if not msg.reply_to_message:
         await msg.reply_text("User ke message par reply karke command chalao.")
         return
-    user_id = db.get_clone_user(bot_id, msg.reply_to_message.message_id)
+    user_id = db.get_clone_user(bot_id, msg.chat_id, msg.reply_to_message.message_id)
     if user_id is None:
         await msg.reply_text("Is message se user nahi mila.")
         return
@@ -710,8 +738,7 @@ async def c_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def c_block_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    owner_id = context.application.bot_data["owner_id"]
-    if query.from_user.id != owner_id:
+    if not _is_staff(context, query.from_user.id):
         return
     _, action, uid = query.data.split("_")  # cb_blk_<id> / cb_ubk_<id>
     blocked = action == "blk"
@@ -720,6 +747,127 @@ async def c_block_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_reply_markup(reply_markup=_block_kb(int(uid), blocked))
     except TelegramError:
         pass
+
+
+# ---------------------------------------------------------------- moderators
+
+_MOD_WELCOME = (
+    "🛡 Aap is bot ke <b>moderator</b> ho. Jab koi is bot ko message karega, wo yahin aayega.\n\n"
+    "• Jawab dene ke liye us message par <b>reply</b> karo.\n"
+    "• /ban aur /unban user ke message par reply karke chalte hain "
+    "(ya message ke neeche wala Block button).\n\n"
+    "Owner ke paas aapko hatane ka haq hai (/delmod)."
+)
+_OWNER_CMDS = [
+    BotCommand("autodelete", "Auto-delete timer"),
+    BotCommand("del", "Reply to a sent message: delete for user too"),
+    BotCommand("addmod", "Add moderator (reply to user msg or /addmod <id>)"),
+    BotCommand("delmod", "Remove moderator"),
+    BotCommand("mods", "List moderators"),
+    BotCommand("ban", "Reply to a user message: block user"),
+    BotCommand("unban", "Reply to a user message: unblock user"),
+]
+_MOD_CMDS = [
+    BotCommand("ban", "Reply to a user message: block user"),
+    BotCommand("unban", "Reply to a user message: unblock user"),
+]
+
+
+def _is_staff(context, user_id) -> bool:
+    return user_id == context.application.bot_data["owner_id"] \
+        or user_id in context.application.bot_data["mods"]
+
+
+def _mod_target(update, context):
+    """User id from '/cmd <id>' or from a reply to a forwarded user message."""
+    msg = update.effective_message
+    if context.args and context.args[0].isdigit():
+        return int(context.args[0])
+    if msg.reply_to_message:
+        return db.get_clone_user(context.bot.id, msg.chat_id, msg.reply_to_message.message_id)
+    return None
+
+
+async def c_addmod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    bot_data = context.application.bot_data
+    uid = _mod_target(update, context)
+    if uid is None:
+        await msg.reply_text(
+            "Kisko moderator banana hai? Us user ke message par reply karke /addmod likho, "
+            "ya /addmod <user_id>. Wo user is bot ko pehle Start kar chuka hona chahiye."
+        )
+        return
+    if uid == bot_data["owner_id"]:
+        await msg.reply_text("Aap to owner ho, moderator banne ki zaroorat nahi.")
+        return
+    if uid in bot_data["mods"]:
+        await msg.reply_text("Ye pehle se moderator hai.")
+        return
+    if len(bot_data["mods"]) >= Config.MAX_CLONE_MODS:
+        await msg.reply_text(f"❌ Zyada se zyada {Config.MAX_CLONE_MODS} moderators ho sakte hain.")
+        return
+    # DM first: proves the person can actually receive messages from this bot.
+    try:
+        await context.bot.send_message(uid, _MOD_WELCOME, parse_mode="HTML")
+    except TelegramError:
+        await msg.reply_text(
+            "❌ Us user ko message nahi bhej paya. Usse bolo is bot ko kholkar ek baar "
+            "Start dabaye (aur bot block na kiya ho), phir dobara /addmod karo."
+        )
+        return
+    db.add_clone_mod(context.bot.id, uid)
+    bot_data["mods"].append(uid)
+    bot_data["staff_f"].add_user_ids(uid)
+    try:
+        await context.bot.set_my_commands(_MOD_CMDS, scope=BotCommandScopeChat(uid))
+    except TelegramError:
+        pass
+    await msg.reply_text(
+        f"✅ <code>{uid}</code> ab moderator hai. Ab se users ke saare messages use bhi "
+        "dikhenge aur wo reply / ban / unban kar sakta hai. Hatane ke liye /delmod.",
+        parse_mode="HTML",
+    )
+
+
+async def c_delmod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    bot_data = context.application.bot_data
+    uid = _mod_target(update, context)
+    if uid is None or uid not in bot_data["mods"]:
+        await msg.reply_text(
+            "Moderator ka ID do: /delmod <user_id> (list ke liye /mods)."
+        )
+        return
+    db.remove_clone_mod(context.bot.id, uid)
+    bot_data["mods"].remove(uid)
+    bot_data["staff_f"].remove_user_ids(uid)
+    try:
+        await context.bot.delete_my_commands(scope=BotCommandScopeChat(uid))
+        await context.bot.send_message(uid, "ℹ️ Aap ab is bot ke moderator nahi ho.")
+    except TelegramError:
+        pass
+    await msg.reply_text(f"✅ <code>{uid}</code> ko moderator se hata diya.", parse_mode="HTML")
+
+
+async def c_mods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    mods = context.application.bot_data["mods"]
+    if not mods:
+        await update.effective_message.reply_text(
+            "Abhi koi moderator nahi hai. /addmod se add karo."
+        )
+        return
+    lines = [f"🛡 <b>Moderators ({len(mods)}/{Config.MAX_CLONE_MODS})</b>\n"]
+    for uid in mods:
+        label = ""
+        try:
+            chat = await context.bot.get_chat(uid)
+            label = " - " + html.escape(chat.full_name or "") + (
+                f" (@{html.escape(chat.username)})" if chat.username else "")
+        except TelegramError:
+            pass
+        lines.append(f"• <code>{uid}</code>{label}")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def c_error(update, context) -> None:
@@ -733,25 +881,32 @@ def build_child_app(token, owner_id):
     app.bot_data["owner_id"] = owner_id
     row = db.get_clone(int(token.split(":")[0]))
     app.bot_data["autodel"] = (row or {}).get("autodel_seconds", 0)
+    app.bot_data["mods"] = list((row or {}).get("mods") or [])
 
     owner = filters.User(user_id=owner_id)
+    # Owner + moderators. Mutable: /addmod and /delmod change it while the bot runs.
+    staff = filters.User(user_id=[owner_id, *app.bot_data["mods"]])
+    app.bot_data["staff_f"] = staff
     private = filters.ChatType.PRIVATE
 
     app.add_handler(CommandHandler("start", c_start, filters=private))
-    app.add_handler(CommandHandler("ban", c_ban, filters=owner))
-    app.add_handler(CommandHandler("unban", c_unban, filters=owner))
+    app.add_handler(CommandHandler("ban", c_ban, filters=staff & private))
+    app.add_handler(CommandHandler("unban", c_unban, filters=staff & private))
     app.add_handler(CommandHandler("autodelete", c_autodelete, filters=owner & private))
     app.add_handler(CommandHandler("del", c_del, filters=owner & private))
+    app.add_handler(CommandHandler("addmod", c_addmod, filters=owner & private))
+    app.add_handler(CommandHandler("delmod", c_delmod, filters=owner & private))
+    app.add_handler(CommandHandler("mods", c_mods, filters=owner & private))
     app.add_handler(CallbackQueryHandler(c_block_button, pattern=r"^cb_(blk|ubk)_\d+$"))
     app.add_handler(CallbackQueryHandler(c_autodel_button, pattern=r"^ca_\d+$"))
     app.add_handler(CallbackQueryHandler(c_del_button, pattern=r"^cd_\d+$"))
     app.add_handler(
-        MessageHandler(owner & private & filters.REPLY & ~filters.COMMAND, c_from_owner)
+        MessageHandler(staff & private & filters.REPLY & ~filters.COMMAND, c_from_owner)
     )
     app.add_handler(
-        MessageHandler(owner & private & ~filters.REPLY & ~filters.COMMAND, c_owner_hint)
+        MessageHandler(staff & private & ~filters.REPLY & ~filters.COMMAND, c_owner_hint)
     )
-    app.add_handler(MessageHandler(private & ~owner & ~filters.COMMAND, c_from_user))
+    app.add_handler(MessageHandler(private & ~staff & ~filters.COMMAND, c_from_user))
     app.add_error_handler(c_error)
     return app
 
@@ -779,14 +934,13 @@ async def start_child(token, owner_id):
         await _teardown(app)
         raise
     running[app.bot.id] = app
-    try:  # show the new commands in the owner's "/" menu (needs owner to have pressed Start)
-        await app.bot.set_my_commands(
-            [BotCommand("autodelete", "Auto-delete timer"),
-             BotCommand("del", "Reply to a sent message: delete for user too")],
-            scope=BotCommandScopeChat(owner_id),
-        )
-    except TelegramError:
-        pass
+    # show the commands in each staff member's "/" menu (needs them to have pressed Start)
+    for uid, cmds in [(owner_id, _OWNER_CMDS),
+                      *((m, _MOD_CMDS) for m in app.bot_data["mods"])]:
+        try:
+            await app.bot.set_my_commands(cmds, scope=BotCommandScopeChat(uid))
+        except TelegramError:
+            pass
     return app
 
 

@@ -104,8 +104,22 @@ class Database:
         except Exception as e:
             print(f"[WARN] clones owner_id index migrate failed: {e}")
         self.clones.create_index("owner_id")
+        # clone_msgs is now keyed per chat too (owner AND moderators each get a copy, and
+        # Telegram message ids are only unique within one chat). Migrate old rows once:
+        # they all belong to the owner's chat -> backfill chat_id, then swap the unique index.
+        try:
+            for c in self.clones.find({}, {"bot_id": 1, "owner_id": 1}):
+                self.clone_msgs.update_many(
+                    {"bot_id": c["bot_id"], "chat_id": {"$exists": False}},
+                    {"$set": {"chat_id": c["owner_id"]}},
+                )
+            if "bot_id_1_owner_msg_id_1" in self.clone_msgs.index_information():
+                self.clone_msgs.drop_index("bot_id_1_owner_msg_id_1")
+        except Exception as e:
+            print(f"[WARN] clone_msgs chat_id migrate failed: {e}")
         self.clone_msgs.create_index(
-            [("bot_id", ASCENDING), ("owner_msg_id", ASCENDING)], unique=True
+            [("bot_id", ASCENDING), ("chat_id", ASCENDING), ("owner_msg_id", ASCENDING)],
+            unique=True,
         )
         self.clone_blocked.create_index(
             [("bot_id", ASCENDING), ("user_id", ASCENDING)], unique=True
@@ -819,15 +833,28 @@ class Database:
         self.clone_autodel.delete_many({"bot_id": bot_id})
         self.clone_sent.delete_many({"bot_id": bot_id})
 
-    def save_clone_map(self, bot_id, owner_msg_id, user_id):
+    # ----- clone moderators (stored on the clone document) -----
+    def get_clone_mods(self, bot_id):
+        doc = self.clones.find_one({"bot_id": bot_id}, {"mods": 1})
+        return list((doc or {}).get("mods") or [])
+
+    def add_clone_mod(self, bot_id, user_id):
+        self.clones.update_one({"bot_id": bot_id}, {"$addToSet": {"mods": user_id}})
+
+    def remove_clone_mod(self, bot_id, user_id):
+        self.clones.update_one({"bot_id": bot_id}, {"$pull": {"mods": user_id}})
+
+    def save_clone_map(self, bot_id, chat_id, owner_msg_id, user_id):
+        """Staff-chat message -> the user it came from. chat_id = the owner's or a moderator's chat."""
         self.clone_msgs.update_one(
-            {"bot_id": bot_id, "owner_msg_id": owner_msg_id},
+            {"bot_id": bot_id, "chat_id": chat_id, "owner_msg_id": owner_msg_id},
             {"$set": {"user_id": user_id, "created_at": datetime.utcnow()}},
             upsert=True,
         )
 
-    def get_clone_user(self, bot_id, owner_msg_id):
-        doc = self.clone_msgs.find_one({"bot_id": bot_id, "owner_msg_id": owner_msg_id})
+    def get_clone_user(self, bot_id, chat_id, owner_msg_id):
+        doc = self.clone_msgs.find_one(
+            {"bot_id": bot_id, "chat_id": chat_id, "owner_msg_id": owner_msg_id})
         return doc["user_id"] if doc else None
 
     def is_clone_blocked(self, bot_id, user_id):
@@ -867,8 +894,9 @@ class Database:
     def clear_clone_autodel(self, bot_id):
         self.clone_autodel.delete_many({"bot_id": bot_id})
 
-    def delete_clone_map(self, bot_id, owner_msg_id):
-        self.clone_msgs.delete_one({"bot_id": bot_id, "owner_msg_id": owner_msg_id})
+    def delete_clone_map(self, bot_id, chat_id, owner_msg_id):
+        self.clone_msgs.delete_one(
+            {"bot_id": bot_id, "chat_id": chat_id, "owner_msg_id": owner_msg_id})
 
     # ----- clone: owner reply -> user's copy (delete for both sides) -----
     def save_clone_sent(self, bot_id, owner_msg_id, confirm_msg_id, user_id, user_msg_id):
