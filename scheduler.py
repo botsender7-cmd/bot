@@ -3,8 +3,9 @@ from apscheduler.triggers.date import DateTrigger
 from datetime import datetime, timedelta, timezone
 from database import db
 from telegram import Bot
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 import asyncio
+import time
 import logging
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,13 @@ DB_POLL_INTERVAL = 30
 # the job clearly never ran (misfire / lost job) - the poll loop takes over.
 STUCK_GRACE_SECONDS = 60
 
+# Minimum spacing between two sends to the SAME chat. Telegram allows ~20 msgs/min
+# per group/channel. Normal batches are already spaced 3s apart so this adds no
+# delay; it only matters when many messages become due at once (catch-up after
+# downtime), where firing 100 sends in parallel would hit 429 flood-control.
+PER_CHAT_MIN_GAP = 3.0
+FLOOD_RETRIES = 3
+
 
 class MessageScheduler:
     def __init__(self, bot: Bot):
@@ -30,6 +38,9 @@ class MessageScheduler:
         # msg_ids whose send is happening RIGHT NOW (guards against the poll loop
         # double-firing a message whose send is slow, e.g. a large upload).
         self._sending: set = set()
+        # Per-chat pacing state (see PER_CHAT_MIN_GAP).
+        self._chat_locks: dict = {}
+        self._chat_last_send: dict = {}
 
     def _get_scheduler(self):
         """Return the scheduler, starting it inside the running loop if needed."""
@@ -102,6 +113,41 @@ class MessageScheduler:
         except (TypeError, ValueError):
             pass
 
+        # Serialize + pace sends per chat, and retry on Telegram flood-control (429).
+        lock = self._chat_locks.setdefault(target_id, asyncio.Lock())
+        async with lock:
+            wait = self._chat_last_send.get(target_id, 0) + PER_CHAT_MIN_GAP - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                for attempt in range(FLOOD_RETRIES + 1):
+                    try:
+                        await self._do_send_once(msg_id, target_type, target_id, message_text,
+                                                 media_type, media_file_id, media_caption, reply_markup)
+                        return
+                    except RetryAfter as ra:
+                        if attempt == FLOOD_RETRIES:
+                            self._fail(msg_id, ra)
+                            await self._notify_failure(msg_id, ra)
+                            return
+                        delay = ra.retry_after
+                        delay = delay.total_seconds() if hasattr(delay, "total_seconds") else float(delay)
+                        logger.warning(f"[SCHEDULER] msg_id={msg_id} flood-limited, retry in {delay + 1:.0f}s")
+                        await asyncio.sleep(delay + 1)
+                    except Exception as e:
+                        self._fail(msg_id, e)
+                        await self._notify_failure(msg_id, e)
+                        return
+            finally:
+                self._chat_last_send[target_id] = time.monotonic()
+
+    def _fail(self, msg_id, err):
+        db.update_message_status(msg_id, f"failed: {str(err)}")
+        logger.error(f"[SCHEDULER ERROR] msg_id={msg_id}: {err}", exc_info=True)
+
+    async def _do_send_once(self, msg_id, target_type, target_id, message_text,
+                            media_type, media_file_id, media_caption, reply_markup):
+
         try:
             caption = media_caption or message_text
 
@@ -166,11 +212,9 @@ class MessageScheduler:
             db.update_message_status(msg_id, "sent")
             logger.info(f"[SCHEDULER] msg_id={msg_id} sent successfully to {target_id}")
 
-        except Exception as e:
-            error_msg = f"failed: {str(e)}"
-            db.update_message_status(msg_id, error_msg)
-            logger.error(f"[SCHEDULER ERROR] msg_id={msg_id}: {e}", exc_info=True)
-            await self._notify_failure(msg_id, e)
+        except RetryAfter:
+            raise  # handled by _do_send (sleep + retry)
+        # any other exception also propagates to _do_send, which records the failure
 
     async def _notify_failure(self, msg_id, err):
         """Tell the user who scheduled it WHY it failed (previously silent)."""

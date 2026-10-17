@@ -376,8 +376,10 @@ async def check_restriction_and_reply(update, context, user_id):
         return True
     return False
 
-async def notify_owner_admins_new_media(context, user, media_type, schedule_time_utc, upload_dt):
-    """Sends the 'New Scheduled Media' notification to the owner and all admins."""
+async def notify_owner_admins_new_media(context, user, media_type, schedule_time_utc, upload_dt, count=1):
+    """Sends the 'New Scheduled Media' notification to the owner and all admins.
+    `count` > 1 means one summary for a whole batch (not one DM per item, which
+    would flood owner/admins with 100 messages for a 100-audio batch)."""
     username = f"@{user.username}" if user.username else "N/A"
     full_name = " ".join(filter(None, [user.first_name, user.last_name]))
     text = (
@@ -385,7 +387,7 @@ async def notify_owner_admins_new_media(context, user, media_type, schedule_time
         f"User ID: {user.id}\n"
         f"Username: {username}\n"
         f"Full Name: {full_name or 'N/A'}\n"
-        f"Media Type: {media_type.title()}\n"
+        f"Media Type: {media_type.title()}" + (f" ×{count}" if count > 1 else "") + "\n"
         f"Scheduled Time: {schedule_time_utc.strftime('%Y-%m-%d %H:%M')}\n"
         f"Uploaded At: {upload_dt.strftime('%Y-%m-%d %H:%M')}"
     )
@@ -1439,7 +1441,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mod_lookup_mode"] = "full"
 
 
-MAX_BATCH_ITEMS = 10          # per-run cap (Telegram flood limits: ~20 msgs/min per group)
+MAX_BATCH_ITEMS = 100         # per-run cap. Sends are spaced BATCH_GAP_SECONDS apart (3s = 20 msgs/min,
+                              # Telegram's per-chat limit), so 100 items take ~5 min to go out.
 BATCH_GAP_SECONDS = 3         # spacing between items so order is preserved
 SCHEDULE_BULK = "sched_bulk"   # state: user is sending many items of one type
 _ITEM_KEYS = ("sched_media_type", "sched_media_file_id", "sched_media_caption",
@@ -1460,8 +1463,28 @@ _MEDIA_NAMES = {
 }
 
 
+def _media_name(media_type):
+    return _MEDIA_NAMES.get(media_type, chr(0x1F4DD) + ' Text')
+
+
+def _grouped_lines(items):
+    """['1-100. 🎵 Audio'] style summary: consecutive items of the same type
+    collapse into one line, so 100 items never blow Telegram's 4096-char limit."""
+    lines, start = [], 0
+    for i in range(1, len(items) + 1):
+        if i == len(items) or items[i] != items[start]:
+            n = i - start
+            rng = f"{start + 1}" if n == 1 else f"{start + 1}-{i}"
+            lines.append(f"{rng}. {_media_name(items[start])}" + (f" ×{n}" if n > 1 else ""))
+            start = i
+    return lines
+
+
 def _batch_text(batch, header, more_hint=None):
-    lines = [f"{i}. {_MEDIA_NAMES.get(it['media_type'], chr(0x1F4DD) + ' Text')}" for i, it in enumerate(batch, 1)]
+    if len(batch) > 15:
+        lines = _grouped_lines([it["media_type"] for it in batch])
+    else:
+        lines = [f"{i}. {_media_name(it['media_type'])}" for i, it in enumerate(batch, 1)]
     if len(batch) >= MAX_BATCH_ITEMS:
         footer = "\n\nLimit poori ho gayi - ab Done dabayein."
     else:
@@ -1639,9 +1662,12 @@ async def _finalize_schedule(update, context, user, schedule_time_utc, ist_displ
         return
 
     created = []
+    copyright_counts = {}   # media_type -> [count, first run_at]
     for i, item in enumerate(batch):
         run_at = schedule_time_utc + timedelta(seconds=i * BATCH_GAP_SECONDS)
-        msg_data = db.add_scheduled_message(
+        # pymongo is blocking: run it in a thread so 100 inserts don't freeze the event loop.
+        msg_data = await asyncio.to_thread(
+            db.add_scheduled_message,
             user.id, target_type, target_id, item["message_text"], run_at,
             media_type=item["media_type"], media_file_id=item["media_file_id"],
             media_caption=item["media_caption"]
@@ -1659,7 +1685,8 @@ async def _finalize_schedule(update, context, user, schedule_time_utc, ist_displ
         # ===== COPYRIGHT: LOG + NOTIFY OWNER/ADMINS (per item) =====
         if item["media_type"] in Config.COPYRIGHT_RELEVANT_MEDIA_TYPES:
             upload_dt = datetime.utcnow()
-            db.log_scheduled_media(
+            await asyncio.to_thread(
+                db.log_scheduled_media,
                 user_id=user.id,
                 file_id=item["media_file_id"],
                 message_id=msg_data["id"],
@@ -1667,7 +1694,8 @@ async def _finalize_schedule(update, context, user, schedule_time_utc, ist_displ
                 schedule_time=run_at,
                 upload_date=upload_dt
             )
-            await notify_owner_admins_new_media(context, user, item["media_type"], run_at, upload_dt)
+            entry = copyright_counts.setdefault(item["media_type"], [0, run_at])
+            entry[0] += 1
 
         created.append((item, msg_data["id"]))
 
@@ -1676,8 +1704,16 @@ async def _finalize_schedule(update, context, user, schedule_time_utc, ist_displ
         context.user_data.clear()
         return
 
-    lines = [f"{i}. {_MEDIA_NAMES.get(it['media_type'], chr(0x1F4DD) + ' Text')} - ID `{mid}`"
-             for i, (it, mid) in enumerate(created, 1)]
+    # Owner/admin notification: ONE summary per media type (log rows stay per item).
+    upload_dt = datetime.utcnow()
+    for mtype, (cnt, first_run) in copyright_counts.items():
+        await notify_owner_admins_new_media(context, user, mtype, first_run, upload_dt, count=cnt)
+
+    if len(created) > 15:
+        ids = [mid for _, mid in created]
+        lines = _grouped_lines([it["media_type"] for it, _ in created]) + [f"IDs: `{ids[0]}` – `{ids[-1]}`"]
+    else:
+        lines = [f"{i}. {_media_name(it['media_type'])} - ID `{mid}`" for i, (it, mid) in enumerate(created, 1)]
     await update.message.reply_text(
         f"\u2705 **{len(created)} message(s) Scheduled!**\n\n"
         f"Target: {target_type}\n"
